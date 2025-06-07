@@ -115,7 +115,7 @@ If you encounter a problem, or if you have found a better solution for the anti-
 -   A detailed description of the issue/solution
 -   Steps you have already taken
 
-**Join our community for support:** [https://discord.gg/f7qQbGwFwZ](https://discord.gg/f7qQbGwFwZ)
+**Join our community:** [https://discord.gg/f7qQbGwFwZ](https://discord.gg/f7qQbGwFwZ)
 
 ---
 (Server side code is not included.)
