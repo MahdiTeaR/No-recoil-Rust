@@ -1,4 +1,4 @@
-## No Recoil Ruust (open source)
+## No Recoil Rust (open source)
 ![image](https://github.com/user-attachments/assets/d7ae89d3-b427-43b2-b761-563bb38a091c)
 ![image](https://github.com/user-attachments/assets/44675205-f7be-493d-95fc-b001c7d77eff)
 ## 📋 Introduction
