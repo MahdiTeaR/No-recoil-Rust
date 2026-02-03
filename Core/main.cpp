@@ -1,14 +1,14 @@
-#define _WIN32_WINNT 0x0A00 // Windows 10
+#define _WIN32_WINNT 0x0A00 
 #include <windows.h>
 #include <winioctl.h>
-#include <iostream> // Keep for logging to console/file
-#include <cstdio>   // For printf
-#include <cstdlib>  // For std::atexit
+#include <iostream> 
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include <array>
 #include <string>
 #include <map>
-#include <cmath> // Needed for floor(), ceil()
+#include <cmath>
 #include <thread>
 #include <chrono>
 #include <atomic>
@@ -16,33 +16,32 @@
 #include <stdexcept>
 #include <algorithm>
 #include <fstream>
-#include <sstream> // For string stream operations
-#include <iomanip> // For std::fixed and std::setprecision
-#include <ctime>   // For time formatting
-#include <shellapi.h> // For ShellExecute
-#include <atomic> // For g_is_logging_in    
-#include <wininet.h> // For internet functions
-#include <mmsystem.h> // For PlaySound
-#include <iphlpapi.h> // For GetAdaptersInfo
-#include <lmcons.h>   // For UNLEN
-#include <sysinfoapi.h> // For GetSystemInfo, GlobalMemoryStatusEx
-#include <VersionHelpers.h> // For IsWindows*OrGreater macros
-#include <dwmapi.h> // Include dwmapi.h AFTER windows.h and _WIN32_WINNT is defined
-#include <fileapi.h> // For GetVolumeInformation
-#include <winuser.h> // For GetSystemMetrics
-#include <timeapi.h> // For GetTickCount64
-#include <dxgi.h> // For DXGI_ADAPTER_DESC and related interfaces
-#include <locale.h> // For _get_user_locale / setlocale, although GetUserDefaultUILanguage is better
-#include <winreg.h> // For Registry access (VM Check)
-#include <winnls.h> // For Language/Locale info
-#include <vector> // Needed for Base64
-#include <stdint.h> // Needed for Base64 uint8_t
-#include <shlobj.h> // For SHGetFolderPathA
-#include <tlhelp32.h> // For CreateToolhelp32Snapshot, Process32First, Process32Next
-#include <psapi.h> // For EnumProcessModules, GetModuleFileNameExA
-#include <winsvc.h> // For service control manager APIs (driver install/start)
-#include "json.hpp" // For JSON parsing (Make sure the path is correct)
-#include "picosha2.h" // Include picosha2 for hashing
+#include <sstream>
+#include <iomanip>
+#include <ctime>
+#include <shellapi.h>
+#include <wininet.h>
+#include <mmsystem.h>
+#include <iphlpapi.h>
+#include <lmcons.h>
+#include <sysinfoapi.h>
+#include <VersionHelpers.h>
+#include <dwmapi.h>
+#include <fileapi.h>
+#include <winuser.h>
+#include <timeapi.h>
+#include <dxgi.h>
+#include <locale.h>
+#include <winreg.h>
+#include <winnls.h>
+#include <vector>
+#include <stdint.h>
+#include <shlobj.h>
+#include <tlhelp32.h>
+#include <psapi.h>
+#include <winsvc.h>
+#include "json.hpp"
+#include "picosha2.h"
 
 enum class UINoticeLevel {
     Info,
@@ -55,7 +54,7 @@ void set_ui_notice(UINoticeLevel level,
                    const std::string& message,
                    const std::string& details = std::string());
 void clear_ui_notice();
-// --- Core.sys Mouse Driver 
+// --- Core.sys Driver 
 #define IOCTL_MOUSE_MOVE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_MOUSE_MOVE_RAW 0x220444
 
@@ -145,7 +144,7 @@ public:
 
         if (!result) {
             DWORD error = GetLastError();
-            std::cerr << "DeviceIoControl (Core mouse driver) failed. Error: " << error << std::endl;
+            std::cerr << "DeviceIoControl (driver) failed. Error: " << error << std::endl;
             return false;
         }
 
@@ -235,10 +234,7 @@ bool FileExistsA(const std::string& path) {
     return (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY));
 }
 
-// Helper to try to locate Steam's loginusers.vdf in a flexible way
-// 1) Default install path (C:\\Program Files (x86)\\Steam\\config\\loginusers.vdf)
-// 2) Registry: HKCU / HKLM Software\\Valve\\Steam (SteamPath / InstallPath) + "\\config\\loginusers.vdf"
-// 3) If a steam.exe process is running, use its folder + "\\config\\loginusers.vdf"
+
 std::string find_steam_loginusers_vdf_path() {
     // 1) Default path
     const char* default_path = "C:\\Program Files (x86)\\Steam\\config\\loginusers.vdf";
@@ -2580,9 +2576,6 @@ const std::array<double, WEAPON_MAX> weapon_delays = {
     /* Semi   */ 175.0
 };
 
-// برای سازگاری با کد موجود، هنوز ثابت‌های per-gun را نگه می‌داریم ولی آن‌ها را از جدول جدید پر می‌کنیم.
-
-// --- Recoil Data (Raw Offsets) (سازگار با کد قدیمی) ---
 std::vector<double> AK47_OFFSET_X;
 std::vector<double> AK47_OFFSET_Y;
 double AK47_RPM_DELAY = weapon_delays[WEAPON_AK47];
@@ -2631,7 +2624,6 @@ int PYTHON_BULLETS = 0;
 
 
 
-// --- Recoil Profile Data Structure ---
 struct RecoilProfileData {
     std::vector<int> comp_x; // Calculated compensation pixels X
     std::vector<int> comp_y; // Calculated compensation pixels Y
@@ -4247,39 +4239,15 @@ void perform_recoil_control() {
                 if (!stop_recoil_flag.load(std::memory_order_relaxed)) {
                     sleep_ms(static_cast<int>(current_st));
                 }
-                 // --- End Recoil Calculation and Movement ---
-
-                // Recoil compensation logic
-                // Add debug log here to show calculated compensation values before mouse movement
-                // Recoil thread log removed
 
             } // End of bullet loop
 
             // Check if we need to exit the outer RMB-held loop
             if (exit_spray_loop_completely) {
-                // Recoil thread log removed
-                goto check_global_state_outer; // Jump to the very start
+                goto check_global_state_outer;
             }
 
-            // If we are here, it means the spray loop was exited because LMB was released (while RMB was held)
-            // The outer `while (right_mouse_down)` loop will continue, waiting for the next LMB press (Step 4).
-
         } // End of RMB-held loop `while (right_mouse_down.load())`
-
-        // --- RMB was RELEASED ---
-        // This part is reached when the outer while(right_mouse_down.load()) condition becomes false
-        // Recoil thread log removed
-        // The outer while(true) loop will then re-check global state and wait for RMB down again.
-
-        // 6. Spray finished (completed or interrupted by LMB release)
-        // No need for a separate while loop here. The outer while(right_mouse_down)
-        // and the checks at the beginning of that loop will handle the state.
-        // Just ensure the stop_recoil_flag is set if the spray was interrupted by LMB release.
-        // The conditions inside the spray loop should have already set stop_recoil_flag
-        // when LMB was released.
-
-        // Optional: Add a small sleep here before re-checking RMB state in the outer loop
-        // sleep_ms(10); // Give input thread a moment to update state consistently
 
     } // End of main while(true) loop
 }
@@ -4294,7 +4262,6 @@ void perform_door_unlock_sequence(int key_code) {
          output_log_message("Door unlock code is 0, sequence skipped.\n");
          return;
      }
-
 
     output_log_message("Starting door unlock sequence for code: " + std::to_string(key_code) + "\n");
 
@@ -4364,16 +4331,12 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
              // Check if we are currently capturing a keybind
              if (g_is_capturing_keybind.load(std::memory_order_relaxed)) {
-                 // If capturing the Door Unlock Trigger, ignore keyboard input (except UI/Exit/Global Toggle)
-                 // Door Unlock Trigger must be a mouse button, handled in mouse hook
                  if (g_profile_being_rebound == "DOOR_UNLOCK_TRIGGER") {
                      // UI Toggle, Exit, and Global Toggle keys are handled below and allowed through
                      // Consume all other keyboard presses while capturing Door Unlock Trigger
                      return 1;
                  }
 
-                 // If capturing other keybinds (weapon, UI toggle, Exit, Global Toggle, LMB, RMB)
-                 // Avoid capturing modifier keys alone, or mouse buttons (mouse buttons handled in mouse hook)
                  if (vkCode != VK_SHIFT && vkCode != VK_CONTROL && vkCode != VK_MENU &&
                      vkCode != VK_LSHIFT && vkCode != VK_RSHIFT &&
                      vkCode != VK_LCONTROL && vkCode != VK_RCONTROL &&
@@ -4383,8 +4346,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                      // Update the keybind based on what is being rebound
                      {
                          std::lock_guard<std::mutex> lock(profile_mutex); // Protect g_profile_keybinds
-                         // LMB/RMB are handled in mouse hook capturing if a mouse button is pressed
-                         // But we allow keyboard keys for LMB/RMB here if a keyboard key is pressed while capturing LMB/RMB
                          if (g_profile_being_rebound == "LMB") {
                               g_lmb_key.store(vkCode);
                               output_log_message("LMB Keybind set to " + vk_code_to_string(vkCode) + "\n");
@@ -4551,16 +4512,11 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-     // Allow ImGui to handle mouse if its window has focus? Could check io.WantCaptureMouse here
-     // if (ImGui::GetCurrentContext() != nullptr && ImGui::GetIO().WantCaptureMouse) {
-     //     return CallNextHookEx(mouse_hook, nCode, wParam, lParam);
-     // }
 
     if (nCode == HC_ACTION) {
         MSLLHOOKSTRUCT* msStruct = (MSLLHOOKSTRUCT*)lParam;
-        int vkCode = 0; // VK code of the mouse button event
+        int vkCode = 0; 
 
-        // Determine the VK code from the mouse message
         switch (wParam) {
             case WM_LBUTTONDOWN: case WM_LBUTTONUP:   vkCode = VK_LBUTTON; break;
             case WM_RBUTTONDOWN: case WM_RBUTTONUP:   vkCode = VK_RBUTTON; break;
@@ -4569,13 +4525,10 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 if (GET_XBUTTON_WPARAM(msStruct->mouseData) == XBUTTON1) vkCode = VK_XBUTTON1;
                 else if (GET_XBUTTON_WPARAM(msStruct->mouseData) == XBUTTON2) vkCode = VK_XBUTTON2;
                 break;
-            // WM_MOUSEWHEEL and WM_MOUSEHWHEEL donنt have standard VK codes used this way
         }
 
-        // If capturing keybinds, capture the mouse button VK code
         if (g_is_capturing_keybind.load(std::memory_order_relaxed)) {
-             // If capturing the Door Unlock Trigger, ignore keyboard input (except UI/Exit/Global Toggle)
-             // Door Unlock Trigger must be a mouse button, handled in mouse hook
+
              if (g_profile_being_rebound == "DOOR_UNLOCK_TRIGGER") {
                  if (vkCode != 0 && (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN)) {
                      // Update the Door Unlock Trigger keybind
@@ -4586,14 +4539,12 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                      g_is_capturing_keybind.store(false, std::memory_order_relaxed);
                      g_profile_being_rebound = ""; // Clear the profile name
 
-                     return 1; // Consume the mouse button press
+                     return 1; 
                  }
-                 // Consume other mouse events (like button up or wheel) while capturing trigger
                  return 1;
              }
              // If capturing other keybinds (weapon, UI toggle, Exit, Global Toggle, LMB, RMB)
              else {
-                 // Capture LMB/RMB if that's what's being rebound AND a mouse button is pressed
                  if (vkCode != 0 && (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN || wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN)) {
                      {
                          std::lock_guard<std::mutex> lock(profile_mutex); // Protect keybind variables
@@ -4611,15 +4562,13 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                          g_is_capturing_keybind.store(false, std::memory_order_relaxed);
                          g_profile_being_rebound = ""; // Clear the profile name
                      }
-                     return 1; // Consume the mouse button press
+                     return 1; 
                  }
-                 // Consume other mouse events (like button up or wheel) while capturing other keybinds
                  return 1;
              }
         }
 
 
-        // Normal mouse handling when not capturing (only process if licensed AND not expired AND global macro is enabled)
         auto now = std::chrono::system_clock::now();
         auto expiration_time = g_activation_time + std::chrono::seconds(g_subscription_duration_seconds);
         bool is_currently_licensed_and_valid = is_licensed.load(std::memory_order_relaxed) && now < expiration_time;
@@ -4632,8 +4581,7 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                  // Trigger the door unlock sequence in a new thread
                  // Detach the thread as we don't need to wait for it to finish
                  std::thread(perform_door_unlock_sequence, g_door_unlock_code).detach();
-                 // Optionally consume the mouse click if you don't want it to register in the game
-                 // return 1; // Consume the mouse button press
+
             }
 
             // --- Existing Recoil Trigger Logic ---
