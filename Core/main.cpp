@@ -55,7 +55,7 @@ void set_ui_notice(UINoticeLevel level,
                    const std::string& message,
                    const std::string& details = std::string());
 void clear_ui_notice();
-// --- Core.sys Mouse Driver (Adverse) ---
+// --- Core.sys Mouse Driver 
 #define IOCTL_MOUSE_MOVE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_MOUSE_MOVE_RAW 0x220444
 
@@ -91,7 +91,7 @@ public:
         }
 
         hDriver = CreateFileW(
-            L"\\\\.\\Adverse",
+            L"\\\\.\\Drive",
             GENERIC_READ | GENERIC_WRITE,
             0,
             NULL,
@@ -102,11 +102,11 @@ public:
 
         if (hDriver == INVALID_HANDLE_VALUE) {
             DWORD err = GetLastError();
-            std::cerr << "Failed to open mouse driver device (Adverse). Error: " << err << std::endl;
+            std::cerr << "Failed to open driver device . Error: " << err << std::endl;
             set_ui_notice(UINoticeLevel::Error,
                           "Driver",
                           "Driver device is not accessible. Run as Administrator and restart your PC if needed.",
-                          std::string("CreateFile(\\\\.\\\\Adverse) error: ") + std::to_string(err));
+                          std::string("CreateFile(\\\\.\\\\Drive) error: ") + std::to_string(err));
             return false;
         }
 
@@ -665,8 +665,8 @@ bool EnsureCoreDriverInstalledAndStarted() {
     CoreMouseDriver probe;
     if (probe.Open()) {
         probe.Close();
-        std::cerr << "Core.sys driver already accessible via \\ \\.\\Adverse. Skipping installation." << std::endl;
-        output_log_message("[CoreDriver] Core.sys device \\.\u00005CAdverse already accessible. Skipping installation.\n");
+        std::cerr << " driver already accessible via \\ \\.\\ Skipping installation." << std::endl;
+        output_log_message(" device \\.\u00005C already accessible. Skipping installation.\n");
         return true;
     }
 
@@ -2403,7 +2403,7 @@ std::atomic<int> g_ui_toggle_key{VK_HOME};     // Default UI Toggle key
 std::atomic<int> g_exit_app_key{VK_INSERT};    // Default Exit App key
 std::atomic<int> g_global_macro_toggle_key{VK_F11}; // DEPRECATED: Was for global macro toggle
 
-// Mouse Button & Special Action Keybinds - Can be mouse buttons or keyboard keys
+// Mouse Button & Special Action Keybinds - Can be  buttons or keyboard keys
 std::atomic<int> g_lmb_key{VK_LBUTTON};      // Default Left Mouse Button
 std::atomic<int> g_rmb_key{VK_RBUTTON};      // Default Right Mouse Button
 std::atomic<int> g_nightModeKey{VK_END};     // Default Night Mode key
@@ -2450,7 +2450,7 @@ struct ThemeSettings {
 ThemeSettings g_theme_settings;
 
 // --- Recoil Data (Raw Offsets) ---
-// از جدول‌های جدید ریکویل (UnknownCheats) برای آپدیت الگوها و اضافه کردن اسلحه‌های جدید استفاده می‌کنیم.
+// از جدول‌های جدید ریکویل  برای آپدیت الگوها و اضافه کردن اسلحه‌های جدید استفاده می‌کنیم.
 
 // برای سادگی، جدول مرجع اصلی را به‌صورت vector<array<double,2>> نگه می‌داریم و بعداً در تابع
 // recalculate_all_profiles_threadsafe آن را به وکتورهای X/Y تبدیل می‌کنیم.
@@ -2635,7 +2635,7 @@ int PYTHON_BULLETS = 0;
 struct RecoilProfileData {
     std::vector<int> comp_x; // Calculated compensation pixels X
     std::vector<int> comp_y; // Calculated compensation pixels Y
-    std::vector<double> action_time; // Time spent moving mouse for each bullet
+    std::vector<double> action_time; // Time spent moving  for each bullet
     std::vector<double> sleep_time;  // Time spent sleeping after moving for each bullet
     int bullets = 0;
     bool is_sar = false;
@@ -2647,8 +2647,8 @@ std::atomic<bool> profile_macro_active{true}; // Renamed from kickback_active
 std::atomic<bool> ui_toggle_key_pressed{false}; // نگهداری وضعیت فشرده شدن کلید UI toggle
 std::string current_gun_profile_str = PROFILE_AK47;        // Name of the currently selected profile
 std::mutex profile_mutex;                        // Protects current_gun_profile_str AND calculated_profiles AND g_profile_keybinds
-std::atomic<bool> left_mouse_down{false};        // State of left mouse button
-std::atomic<bool> right_mouse_down{false};       // State of right mouse button
+std::atomic<bool> left_mouse_down{false};        // State of left  button
+std::atomic<bool> right_mouse_down{false};       // State of right  button
 std::atomic<bool> stop_recoil_flag{false};       // Signal to stop current recoil spray
 std::atomic<bool> g_recoil_thread_should_run{true}; // Controls lifetime of recoil thread
 std::atomic<bool> show_config_window_atomic{true};
@@ -4642,7 +4642,7 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             int rmb_vk = g_rmb_key.load(std::memory_order_relaxed);
             bool auto_crouch_scope_enabled = g_auto_crouch_scope_enabled.load(std::memory_order_relaxed);
 
-            // Check if the incoming mouse button event matches the configured LMB or RMB key
+            // Check if the incoming button event matches the configured LMB or RMB key
             switch (wParam) {
                 case WM_LBUTTONDOWN: if (lmb_vk == VK_LBUTTON) left_mouse_down.store(true, std::memory_order_relaxed); if (rmb_vk == VK_LBUTTON) right_mouse_down.store(true, std::memory_order_relaxed); break;
                 case WM_LBUTTONUP:   if (lmb_vk == VK_LBUTTON) left_mouse_down.store(false, std::memory_order_relaxed); if (rmb_vk == VK_LBUTTON) right_mouse_down.store(false, std::memory_order_relaxed); stop_recoil_flag.store(true); break;
@@ -6418,15 +6418,6 @@ void cleanup_and_exit() {
     if (keyboard_hook) { UnhookWindowsHookEx(keyboard_hook); keyboard_hook = NULL; output_log_message("Keyboard hook removed.\n"); }
     if (mouse_hook) { UnhookWindowsHookEx(mouse_hook); mouse_hook = NULL; output_log_message("Mouse hook removed.\n"); }
 
-    // Signal recoil thread to stop if it has an exit condition
-    // (Current recoil thread is an infinite loop, detach is used)
-    // If you add an exit flag to the recoil thread, set it here and join.
-    // For now, assuming detach is sufficient for the current infinite loop.
-    // If recoil_thread_obj was stored globally and joinable, you'd join it here.
-    // Since it's a local variable in main, we can't join it here easily.
-    // The current detach strategy means the thread might continue briefly after main exits.
-    // For a clean exit, the recoil thread *must* have an exit flag it checks.
-
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
@@ -6626,7 +6617,6 @@ int main(int, char**) {
                     "Please verify Last Version And Check your Internet try again.",
                     "If You Need More Help Send Message To Support TeaM",
                     MB_ICONERROR | MB_OK);
-                // Continue without driver rather than hard-exiting; mouse movement via Core.sys will be disabled.
             }
         }
     } catch (...) {
@@ -7020,7 +7010,7 @@ int main(int, char**) {
 
         output_log_message("Attempting to install mouse hook...\n");
         mouse_hook = SetWindowsHookEx(WH_MOUSE_LL, LowLevelMouseProc, hInstance, 0);
-        if (!mouse_hook) { throw std::runtime_error("Failed to install mouse hook!"); }
+        if (!mouse_hook) { throw std::runtime_error("Failed to install hook!"); }
         output_log_message("Mouse listener started.\n");
 
         // Ensure config directory exists (for settings persistence)
@@ -7045,8 +7035,6 @@ int main(int, char**) {
         // Basic cleanup on initialization error
         std::cerr << "Initialization error: " + std::string(e.what()) << std::endl;
         output_log_message("Initialization error: " + std::string(e.what()) + "\n");
-        // if (keyboard_hook) UnhookWindowsHookEx(keyboard_hook); // Cleanup happens in cleanup_and_exit
-        // if (mouse_hook) UnhookWindowsHookEx(mouse_hook); // Cleanup happens in cleanup_and_exit
         if (recoil_thread_obj.joinable()) {
             g_recoil_thread_should_run.store(false, std::memory_order_relaxed);
             recoil_thread_obj.join(); // Join if started but failed later
@@ -7619,7 +7607,7 @@ int main(int, char**) {
                         profiles_cstr.push_back(profile.c_str());
                     }
                     if (ImGui::Combo("##WeaponSelect", &current_weapon_index, profiles_cstr.data(), profiles_cstr.size())) {
-                        // Weapon selection changed via mouse/keyboard navigation inside combo, update the current gun profile string
+                        // Weapon selection changed via navigation inside combo, update the current gun profile string
                         {
                             std::lock_guard<std::mutex> lock(profile_mutex);
                             current_gun_profile_str = ALL_PROFILES[current_weapon_index];
@@ -7763,7 +7751,7 @@ int main(int, char**) {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.5f, 0.0f, 1.0f)); // Orange color
                         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.6f, 0.2f, 1.0f)); // Lighter orange on hover
                         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.7f, 0.3f, 1.0f)); // Even lighter orange when active
-                        ImGui::Button("Press a key/mouse button..."); // Button text changes while capturing
+                        ImGui::Button("Press a key button..."); // Button text changes while capturing
                         ImGui::PopStyleColor(3); // Pop the 3 color styles
                     } else {
                         if (ImGui::Button("Change##LMB")) {
@@ -7781,7 +7769,7 @@ int main(int, char**) {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.5f, 0.0f, 1.0f)); // Orange color
                         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.6f, 0.2f, 1.0f)); // Lighter orange on hover
                         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.7f, 0.3f, 1.0f)); // Even lighter orange when active
-                        ImGui::Button("Press a key/mouse button..."); // Button text changes while capturing
+                        ImGui::Button("Press a key button..."); // Button text changes while capturing
                         ImGui::PopStyleColor(3); // Pop the 3 color styles
                     } else {
                         if (ImGui::Button("Change##RMB")) {
@@ -7863,7 +7851,7 @@ int main(int, char**) {
                         g_feedback_message_end_time = std::chrono::steady_clock::now() + std::chrono::seconds(3);
                     }
                     ImGui::SameLine();
-                    HelpMarker("When enabled, pressing right mouse button (scope) will automatically press CTRL (crouch) as well.");
+                    HelpMarker("When enabled, pressing right button (scope) will automatically press CTRL (crouch) as well.");
 
                     ImGui::Separator();
 
@@ -7919,7 +7907,7 @@ int main(int, char**) {
                     // --- Door Unlocker View Content ---
                     ImGui::Text("Door Unlocker Feature");
                     ImGui::Separator();
-                    ImGui::TextWrapped("Configure the door code (max 4 digits) and the mouse button to trigger the sequence.");
+                    ImGui::TextWrapped("Configure the door code (max 4 digits) and the  button to trigger the sequence.");
                     ImGui::Spacing();
 
                     // Input for Door Code
@@ -7957,7 +7945,7 @@ int main(int, char**) {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.5f, 0.0f, 1.0f)); // Orange color
                         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.6f, 0.2f, 1.0f)); // Lighter orange on hover
                         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.7f, 0.3f, 1.0f)); // Even lighter orange when active
-                        ImGui::Button("Press a mouse button..."); // Button text changes while capturing
+                        ImGui::Button("Press a button..."); // Button text changes while capturing
                         ImGui::PopStyleColor(3); // Pop the 3 color styles
                     } else {
                         // Display current key and a button to change it
@@ -7983,7 +7971,7 @@ int main(int, char**) {
                     }
 
                     ImGui::Spacing();
-                    ImGui::TextWrapped("Note: The Door Unlocker sequence simulates pressing 'E', moving the mouse, clicking LMB, releasing 'E', and then typing the 4-digit code.");
+                    ImGui::TextWrapped("Note: The Door Unlocker sequence simulates pressing 'E', moving the , clicking LMB, releasing 'E', and then typing the 4-digit code.");
                     ImGui::TextWrapped("Ensure your game is focused and ready before triggering.");
 
                 } else if (current_view == ViewState::Subscription) { // Renamed Support to Subscription
@@ -8122,7 +8110,7 @@ int main(int, char**) {
                      // Check if the last item (the text "") was hovered or clicked
                      if (ImGui::IsItemHovered()) {
                          // Optional: Change cursor to hand when hovered over the link
-                         // ImGui::SetMouseCursor(ImGuiMouseCursor_Hand); // Requires setting mouse cursor globally based on hovered item
+                         // ImGui::SetMouseCursor(ImGuiMouseCursor_Hand); // Requires setting  cursor globally based on hovered item
 
                          // Display a tooltip when hovered
                          ImGui::SetTooltip("Click to open Discord");
