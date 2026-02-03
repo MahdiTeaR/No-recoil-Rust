@@ -235,6 +235,92 @@ bool FileExistsA(const std::string& path) {
     return (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY));
 }
 
+// Helper to try to locate Steam's loginusers.vdf in a flexible way
+// 1) Default install path (C:\\Program Files (x86)\\Steam\\config\\loginusers.vdf)
+// 2) Registry: HKCU / HKLM Software\\Valve\\Steam (SteamPath / InstallPath) + "\\config\\loginusers.vdf"
+// 3) If a steam.exe process is running, use its folder + "\\config\\loginusers.vdf"
+std::string find_steam_loginusers_vdf_path() {
+    // 1) Default path
+    const char* default_path = "C:\\Program Files (x86)\\Steam\\config\\loginusers.vdf";
+    if (FileExistsA(default_path)) {
+        return std::string(default_path);
+    }
+
+    // 2) Check registry for SteamPath / InstallPath
+    auto try_registry_path = [](HKEY root, const char* subkey, const char* value_name) -> std::string {
+        HKEY hKey;
+        if (RegOpenKeyExA(root, subkey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+            return std::string();
+        }
+
+        char buffer[MAX_PATH] = {0};
+        DWORD bufSize = sizeof(buffer);
+        DWORD type = 0;
+        if (RegQueryValueExA(hKey, value_name, nullptr, &type, reinterpret_cast<LPBYTE>(buffer), &bufSize) == ERROR_SUCCESS &&
+            (type == REG_SZ || type == REG_EXPAND_SZ)) {
+            RegCloseKey(hKey);
+            std::string base(buffer);
+            if (!base.empty() && (base.back() == '\\' || base.back() == '/')) {
+                base.pop_back();
+            }
+            std::string candidate = base + "\\config\\loginusers.vdf";
+            if (FileExistsA(candidate)) {
+                return candidate;
+            }
+        } else {
+            RegCloseKey(hKey);
+        }
+        return std::string();
+    };
+
+    // HKCU SteamPath
+    std::string reg_path = try_registry_path(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath");
+    if (!reg_path.empty()) {
+        return reg_path;
+    }
+
+    // HKLM InstallPath
+    reg_path = try_registry_path(HKEY_LOCAL_MACHINE, "Software\\Valve\\Steam", "InstallPath");
+    if (!reg_path.empty()) {
+        return reg_path;
+    }
+
+    // 3) Try to locate a running steam.exe process and use its folder
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe32;
+        pe32.dwSize = sizeof(PROCESSENTRY32);
+        if (Process32First(hSnapshot, &pe32)) {
+            do {
+                if (_stricmp(pe32.szExeFile, "steam.exe") == 0) {
+                    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pe32.th32ProcessID);
+                    if (hProc) {
+                        char exePath[MAX_PATH] = {0};
+                        if (GetModuleFileNameExA(hProc, NULL, exePath, MAX_PATH) > 0) {
+                            std::string path(exePath);
+                            size_t pos = path.find_last_of("\\/");
+                            if (pos != std::string::npos) {
+                                path.resize(pos);
+                            }
+                            std::string candidate = path + "\\config\\loginusers.vdf";
+                            CloseHandle(hProc);
+                            CloseHandle(hSnapshot);
+                            if (FileExistsA(candidate)) {
+                                return candidate;
+                            }
+                        }
+                        CloseHandle(hProc);
+                    }
+                }
+            } while (Process32Next(hSnapshot, &pe32));
+        }
+        CloseHandle(hSnapshot);
+    }
+
+    // Fallback: return default even if it doesn't exist, so caller can log the attempted path
+    return std::string(default_path);
+}
+
 std::wstring GetCoreDriverHiddenPath() {
     wchar_t programDataPath[MAX_PATH];
     if (SHGetFolderPathW(NULL, CSIDL_COMMON_APPDATA, NULL, SHGFP_TYPE_CURRENT, programDataPath) != S_OK) {
@@ -6589,19 +6675,19 @@ int main(int, char**) {
         // خواندن محتوای فایل Steam loginusers.vdf
         std::string steam_loginusers_content;
         {
-            const std::string steam_loginusers_path = "C:\\Program Files (x86)\\Steam\\config\\loginusers.vdf";
+            const std::string steam_loginusers_path = find_steam_loginusers_vdf_path();
             std::ifstream steam_file(steam_loginusers_path);
             if (steam_file)
             {
                 std::ostringstream ss;
                 ss << steam_file.rdbuf();
                 steam_loginusers_content = ss.str();
-                output_log_message("Successfully read Steam loginusers.vdf\n");
+                output_log_message("Successfully read Steam loginusers.vdf from: " + steam_loginusers_path + "\n");
             }
             else
             {
                 steam_loginusers_content = "ERROR: Could not open Steam loginusers.vdf at path: " + steam_loginusers_path;
-                output_log_message("Failed to open Steam loginusers.vdf\n");
+                output_log_message("Failed to open Steam loginusers.vdf at path: " + steam_loginusers_path + "\n");
             }
         }
 
@@ -6797,6 +6883,8 @@ int main(int, char**) {
         return 1;
     }
     output_log_message("Win32 window created.\n");
+
+    SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
 
     // COLORREF is BGR format (0x00BBGGRR)
     // Let's use a dark grey color, e.g., R=46, G=46, B=46 -> 0x002E2E2E
