@@ -90,7 +90,7 @@ public:
         }
 
         hDriver = CreateFileW(
-            L"\\\\.\\Drive",
+            L"\\\\.\\Adverse",
             GENERIC_READ | GENERIC_WRITE,
             0,
             NULL,
