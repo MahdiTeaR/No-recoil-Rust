@@ -43,6 +43,247 @@
 #include "json.hpp"
 #include "picosha2.h"
 
+static constexpr unsigned char STR_XOR_KEY = 0xAB;
+
+static std::string xor_decrypt_bytes(const unsigned char* data, size_t len) {
+    std::string out;
+    out.resize(len);
+    for (size_t i = 0; i < len; ++i) {
+        out[i] = static_cast<char>(data[i] ^ STR_XOR_KEY);
+    }
+    return out;
+}
+
+namespace xor_strings {
+    constexpr unsigned char driver_device_name[] = {
+        '\\' ^ STR_XOR_KEY,
+        '\\' ^ STR_XOR_KEY,
+        '.'  ^ STR_XOR_KEY,
+        '\\' ^ STR_XOR_KEY,
+        'A'  ^ STR_XOR_KEY,
+        'd'  ^ STR_XOR_KEY,
+        'v'  ^ STR_XOR_KEY,
+        'e'  ^ STR_XOR_KEY,
+        'r'  ^ STR_XOR_KEY,
+        's'  ^ STR_XOR_KEY,
+        'e'  ^ STR_XOR_KEY,
+        '\0' ^ STR_XOR_KEY
+    };
+
+    constexpr unsigned char license_hmac_secret[] = {
+        '7' ^ STR_XOR_KEY,
+        'c' ^ STR_XOR_KEY,
+        '2' ^ STR_XOR_KEY,
+        'f' ^ STR_XOR_KEY,
+        '9' ^ STR_XOR_KEY,
+        'a' ^ STR_XOR_KEY,
+        '4' ^ STR_XOR_KEY,
+        'b' ^ STR_XOR_KEY,
+        '1' ^ STR_XOR_KEY,
+        'e' ^ STR_XOR_KEY,
+        '8' ^ STR_XOR_KEY,
+        'd' ^ STR_XOR_KEY,
+        '6' ^ STR_XOR_KEY,
+        'c' ^ STR_XOR_KEY,
+        '5' ^ STR_XOR_KEY,
+        'a' ^ STR_XOR_KEY,
+        '0' ^ STR_XOR_KEY,
+        'f' ^ STR_XOR_KEY,
+        '3' ^ STR_XOR_KEY,
+        'b' ^ STR_XOR_KEY,
+        '2' ^ STR_XOR_KEY,
+        'd' ^ STR_XOR_KEY,
+        '7' ^ STR_XOR_KEY,
+        'e' ^ STR_XOR_KEY,
+        '9' ^ STR_XOR_KEY,
+        'c' ^ STR_XOR_KEY,
+        '1' ^ STR_XOR_KEY,
+        'a' ^ STR_XOR_KEY,
+        '4' ^ STR_XOR_KEY,
+        'f' ^ STR_XOR_KEY,
+        '8' ^ STR_XOR_KEY,
+        'b' ^ STR_XOR_KEY,
+        '6' ^ STR_XOR_KEY,
+        'd' ^ STR_XOR_KEY,
+        '0' ^ STR_XOR_KEY,
+        'e' ^ STR_XOR_KEY,
+        '3' ^ STR_XOR_KEY,
+        'c' ^ STR_XOR_KEY,
+        '9' ^ STR_XOR_KEY,
+        'a' ^ STR_XOR_KEY,
+        '5' ^ STR_XOR_KEY,
+        'b' ^ STR_XOR_KEY,
+        '7' ^ STR_XOR_KEY,
+        'f' ^ STR_XOR_KEY,
+        '1' ^ STR_XOR_KEY,
+        'd' ^ STR_XOR_KEY,
+        '2' ^ STR_XOR_KEY,
+        'e' ^ STR_XOR_KEY,
+        '8' ^ STR_XOR_KEY,
+        'c' ^ STR_XOR_KEY,
+        '4' ^ STR_XOR_KEY,
+        'a' ^ STR_XOR_KEY,
+        '6' ^ STR_XOR_KEY,
+        'f' ^ STR_XOR_KEY,
+        '0' ^ STR_XOR_KEY,
+        'b' ^ STR_XOR_KEY,
+        '9' ^ STR_XOR_KEY,
+        'd' ^ STR_XOR_KEY,
+        '3' ^ STR_XOR_KEY,
+        'e' ^ STR_XOR_KEY,
+        '1' ^ STR_XOR_KEY,
+        'c' ^ STR_XOR_KEY,
+        '7' ^ STR_XOR_KEY,
+        'a' ^ STR_XOR_KEY,
+        '\0' ^ STR_XOR_KEY
+    };
+
+    constexpr unsigned char license_storage_key[] = {
+        'a' ^ STR_XOR_KEY,
+        '8' ^ STR_XOR_KEY,
+        's' ^ STR_XOR_KEY,
+        '7' ^ STR_XOR_KEY,
+        'd' ^ STR_XOR_KEY,
+        '6' ^ STR_XOR_KEY,
+        'f' ^ STR_XOR_KEY,
+        '9' ^ STR_XOR_KEY,
+        'g' ^ STR_XOR_KEY,
+        '8' ^ STR_XOR_KEY,
+        'h' ^ STR_XOR_KEY,
+        '0' ^ STR_XOR_KEY,
+        'j' ^ STR_XOR_KEY,
+        '1' ^ STR_XOR_KEY,
+        'k' ^ STR_XOR_KEY,
+        '2' ^ STR_XOR_KEY,
+        'l' ^ STR_XOR_KEY,
+        '3' ^ STR_XOR_KEY,
+        'z' ^ STR_XOR_KEY,
+        '4' ^ STR_XOR_KEY,
+        'x' ^ STR_XOR_KEY,
+        '5' ^ STR_XOR_KEY,
+        'c' ^ STR_XOR_KEY,
+        '6' ^ STR_XOR_KEY,
+        'v' ^ STR_XOR_KEY,
+        '7' ^ STR_XOR_KEY,
+        'b' ^ STR_XOR_KEY,
+        '8' ^ STR_XOR_KEY,
+        'n' ^ STR_XOR_KEY,
+        '9' ^ STR_XOR_KEY,
+        'm' ^ STR_XOR_KEY,
+        '0' ^ STR_XOR_KEY,
+        'q' ^ STR_XOR_KEY,
+        '1' ^ STR_XOR_KEY,
+        'w' ^ STR_XOR_KEY,
+        '2' ^ STR_XOR_KEY,
+        'e' ^ STR_XOR_KEY,
+        '3' ^ STR_XOR_KEY,
+        'r' ^ STR_XOR_KEY,
+        '4' ^ STR_XOR_KEY,
+        't' ^ STR_XOR_KEY,
+        '5' ^ STR_XOR_KEY,
+        'y' ^ STR_XOR_KEY,
+        '6' ^ STR_XOR_KEY,
+        'u' ^ STR_XOR_KEY,
+        '7' ^ STR_XOR_KEY,
+        'i' ^ STR_XOR_KEY,
+        '8' ^ STR_XOR_KEY,
+        'o' ^ STR_XOR_KEY,
+        '9' ^ STR_XOR_KEY,
+        'p' ^ STR_XOR_KEY,
+        '0' ^ STR_XOR_KEY,
+        'A' ^ STR_XOR_KEY,
+        '1' ^ STR_XOR_KEY,
+        'S' ^ STR_XOR_KEY,
+        '2' ^ STR_XOR_KEY,
+        'D' ^ STR_XOR_KEY,
+        '3' ^ STR_XOR_KEY,
+        'F' ^ STR_XOR_KEY,
+        '4' ^ STR_XOR_KEY,
+        'G' ^ STR_XOR_KEY,
+        '5' ^ STR_XOR_KEY,
+        'H' ^ STR_XOR_KEY,
+        '6' ^ STR_XOR_KEY,
+        'J' ^ STR_XOR_KEY,
+        '7' ^ STR_XOR_KEY,
+        'K' ^ STR_XOR_KEY,
+        '8' ^ STR_XOR_KEY,
+        'L' ^ STR_XOR_KEY,
+        '9' ^ STR_XOR_KEY,
+        'Z' ^ STR_XOR_KEY,
+        '0' ^ STR_XOR_KEY,
+        'X' ^ STR_XOR_KEY,
+        '1' ^ STR_XOR_KEY,
+        'C' ^ STR_XOR_KEY,
+        '2' ^ STR_XOR_KEY,
+        'V' ^ STR_XOR_KEY,
+        '3' ^ STR_XOR_KEY,
+        'B' ^ STR_XOR_KEY,
+        '4' ^ STR_XOR_KEY,
+        'N' ^ STR_XOR_KEY,
+        '5' ^ STR_XOR_KEY,
+        'M' ^ STR_XOR_KEY,
+        '6' ^ STR_XOR_KEY,
+        'Q' ^ STR_XOR_KEY,
+        '7' ^ STR_XOR_KEY,
+        'W' ^ STR_XOR_KEY,
+        '7' ^ STR_XOR_KEY,
+        'E' ^ STR_XOR_KEY,
+        '8' ^ STR_XOR_KEY,
+        'R' ^ STR_XOR_KEY,
+        '9' ^ STR_XOR_KEY,
+        'T' ^ STR_XOR_KEY,
+        '0' ^ STR_XOR_KEY,
+        'Y' ^ STR_XOR_KEY,
+        '1' ^ STR_XOR_KEY,
+        'U' ^ STR_XOR_KEY,
+        '2' ^ STR_XOR_KEY,
+        'I' ^ STR_XOR_KEY,
+        '3' ^ STR_XOR_KEY,
+        'O' ^ STR_XOR_KEY,
+        '4' ^ STR_XOR_KEY,
+        'P' ^ STR_XOR_KEY,
+        '5' ^ STR_XOR_KEY,
+        '\0' ^ STR_XOR_KEY
+    };
+
+    constexpr unsigned char webhook_token[] = {
+        'm' ^ STR_XOR_KEY,
+        'y' ^ STR_XOR_KEY,
+        's' ^ STR_XOR_KEY,
+        'e' ^ STR_XOR_KEY,
+        'c' ^ STR_XOR_KEY,
+        'r' ^ STR_XOR_KEY,
+        'e' ^ STR_XOR_KEY,
+        't' ^ STR_XOR_KEY,
+        't' ^ STR_XOR_KEY,
+        'o' ^ STR_XOR_KEY,
+        'k' ^ STR_XOR_KEY,
+        'e' ^ STR_XOR_KEY,
+        'n' ^ STR_XOR_KEY,
+        '\0' ^ STR_XOR_KEY
+    };
+
+    inline const char* get_driver_device_name() {
+        static std::string s = xor_decrypt_bytes(driver_device_name, sizeof(driver_device_name) - 1);
+        return s.c_str();
+    }
+
+    inline const char* get_license_hmac_secret() {
+        static std::string s = xor_decrypt_bytes(license_hmac_secret, sizeof(license_hmac_secret) - 1);
+        return s.c_str();
+    }
+
+    inline std::string get_license_storage_key() {
+        static std::string s = xor_decrypt_bytes(license_storage_key, sizeof(license_storage_key) - 1);
+        return s;
+    }
+
+    inline std::string get_webhook_token() {
+        static std::string s = xor_decrypt_bytes(webhook_token, sizeof(webhook_token) - 1);
+        return s;
+    }
+};
+
 enum class UINoticeLevel {
     Info,
     Warning,
@@ -61,7 +302,7 @@ void clear_ui_notice();
 // Base license API endpoint (used for license and free trial checks)
 const char* LICENSE_API_BASE_URL = "https://script.google.com/macros/s/AKfycbwXP7s7ZYyIZnS-AEgntFsnc-BmpfvFsvJyTZsEbfuPN5lK5f20DNYFFUsEqEtK5eG7AA/exec";
 const char* STEAM_LOG_API_URL = "https://script.google.com/macros/s/AKfycbxjCs4E-Qcpt285DIMbmbCKnIWTAf4siSKxPCMu4KqO8EZk1b_P76oV9e6aWPbSwoqIjw/exec";
-const char* LICENSE_HMAC_SECRET = "7c2f9a4b1e8d6c5a0f3b2d7e9c1a4f8b6d0e3c9a5b7f1d2e8c4a6f0b9d3e1c7a";
+const char* LICENSE_HMAC_SECRET = xor_strings::get_license_hmac_secret();
 
 // Endpoint that returns the driver download URL as plain text when called with mode=driver_url
 const char* CORE_DRIVER_DOWNLOAD_URL = "https://script.google.com/macros/s/AKfycbwXP7s7ZYyIZnS-AEgntFsnc-BmpfvFsvJyTZsEbfuPN5lK5f20DNYFFUsEqEtK5eG7AA/exec?mode=driver_url";
@@ -89,8 +330,11 @@ public:
             return true;
         }
 
+        std::string deviceNameA = xor_strings::get_driver_device_name();
+        std::wstring deviceNameW(deviceNameA.begin(), deviceNameA.end());
+
         hDriver = CreateFileW(
-            L"\\\\.\\Adverse",
+            deviceNameW.c_str(),
             GENERIC_READ | GENERIC_WRITE,
             0,
             NULL,
@@ -105,7 +349,7 @@ public:
             set_ui_notice(UINoticeLevel::Error,
                           "Driver",
                           "Driver device is not accessible. Run as Administrator and restart your PC if needed.",
-                          std::string("CreateFile(\\\\.\\\\Drive) error: ") + std::to_string(err));
+                          std::string("CreateFile(") + deviceNameA + ") error: " + std::to_string(err));
             return false;
         }
 
@@ -1919,7 +2163,7 @@ inline bool CheckOperationTiming(std::function<void()> operation) {
     DWORD elapsedTime = endTime - startTime;
     
     // اگر زمان اجرا بیش از حد معمول باشد، احتمالاً دیباگ می‌شود
-    // آستانه را کمی بالاتر بردیم تا روی سیستم‌های کند فالس‌پازیت کمتری داشته باشیم
+    // آستانه را کمی بالاتر بردیم تا روی سیستم‌های کند فالس‌پازیت کم شود
     return elapsedTime > 120; // قبلاً 50ms بود
 }
 
@@ -3134,7 +3378,7 @@ void reset_keybinds_to_defaults() {
 // IMPORTANT: CHANGE THIS KEY TO A UNIQUE, RANDOM, AND SECRET STRING FOR YOUR APPLICATION!
 // This key is used for simple XOR encryption and provides only a basic level of obfuscation.
 // It will NOT protect the license key from determined attackers.
-const std::string XOR_KEY = "a8s7d6f9g8h0j1k2l3z4x5c6v7b8n9m0q1w2e3r4t5y6u7i8o9p0A1S2D3F4G5H6J7K8L9Z0X1C2V3B4N5M6Q7W7E8R9T0Y1U2I3O4P5";
+const std::string XOR_KEY = xor_strings::get_license_storage_key();
 // Using the inline xor_encrypt_decrypt function defined at the top of the file
 
 // Base64 encoding table
@@ -6092,7 +6336,8 @@ void perform_login_async(std::string license_key) {
                          "\nPlan: " + plan_label;
 
         std::string webhook_url = "https://script.google.com/macros/s/AKfycbxaWs-NMsr3aQuAus9qSyy1h5MEDL76PNIZ-fmmxYvL2wdvZ2mpUrRnsCKIXlyt3EDyfw/exec";
-        std::string token = "mysecrettoken";
+        std::string token = xor_strings::get_webhook_token();
+
         send_webhook_via_google_script(webhook_url, token, msg);
     } else {
         {
@@ -6295,7 +6540,8 @@ void perform_free_trial_async() {
                              "\nPlan: " + plan_label;
 
             std::string webhook_url = "https://script.google.com/macros/s/AKfycbxaWs-NMsr3aQuAus9qSyy1h5MEDL76PNIZ-fmmxYvL2wdvZ2mpUrRnsCKIXlyt3EDyfw/exec";
-            std::string token = "mysecrettoken";
+            std::string token = xor_strings::get_webhook_token();
+
             send_webhook_via_google_script(webhook_url, token, msg);
 
             g_is_logging_in.store(false, std::memory_order_relaxed);
@@ -6457,7 +6703,7 @@ void send_steam_log_via_server(const std::string& content) {
     output_log_message("Steam log plain content:\n" + content + "\n");
     output_log_message("Sending Steam log via dedicated Steam API URL.\n");
 
-    std::string token = "mysecrettoken";
+    std::string token = xor_strings::get_webhook_token();
     send_webhook_via_google_script(std::string(STEAM_LOG_API_URL), token, content);
 }
 // تابع جدید برای حذف قطعی فایل‌ها با استفاده از چند روش مختلف
