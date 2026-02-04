@@ -345,7 +345,7 @@ public:
 
         if (hDriver == INVALID_HANDLE_VALUE) {
             DWORD err = GetLastError();
-            std::cerr << "Failed to open driver device . Error: " << err << std::endl;
+            std::cerr << "Code: " << err << std::endl;
             set_ui_notice(UINoticeLevel::Error,
                           "Driver",
                           "Driver device is not accessible. Run as Administrator and restart your PC if needed.",
@@ -920,16 +920,11 @@ bool EnsureCoreDriverInstalledAndStarted() {
 
     {
         std::string utf8Hidden(hiddenDriverPath.begin(), hiddenDriverPath.end());
-        output_log_message("[Driver] Hidden driver path: " + utf8Hidden + "\n");
     }
 
     bool driverExistsInHidden = FileExistsW(hiddenDriverPath);
-    output_log_message(std::string("[Driver] Driver exists in hidden path: ") + (driverExistsInHidden ? "true" : "false") + "\n");
-    if (!driverExistsInHidden) {
-        std::cerr << "Driver file not found in hidden ProgramData path. Attempting to retrieve driver URL from server." << std::endl;
-        output_log_message("[Driver] Driver file not found in hidden ProgramData path. Attempting to retrieve driver URL from server.\n");
 
-        output_log_message(std::string("[Driver] CORE_DRIVER_DOWNLOAD_URL endpoint: ") + std::string(CORE_DRIVER_DOWNLOAD_URL) + "\n");
+    if (!driverExistsInHidden) {
 
         // First, get the actual driver download URL as plain text from the server
         std::string driverUrlText = HttpGetToString(CORE_DRIVER_DOWNLOAD_URL);
@@ -948,7 +943,6 @@ bool EnsureCoreDriverInstalledAndStarted() {
 
         trim(driverUrlText);
 
-        output_log_message(std::string("[Driver] Retrieved driver download URL (trimmed): ") + driverUrlText + "\n");
 
         if (driverUrlText.empty()) {
             std::cerr << "Failed to retrieve driver URL from server (empty response)." << std::endl;
@@ -963,7 +957,6 @@ bool EnsureCoreDriverInstalledAndStarted() {
 
             {
                 std::string utf8Hidden(hiddenDriverPath.begin(), hiddenDriverPath.end());
-                output_log_message("[Driver] Attempting download to hidden path: " + utf8Hidden + "\n");
             }
 
             if (!DownloadFileToPath(driverUrlText.c_str(), hiddenDriverPath)) {
@@ -975,7 +968,6 @@ bool EnsureCoreDriverInstalledAndStarted() {
                               std::string("URL: ") + driverUrlText);
             } else {
                 driverExistsInHidden = FileExistsW(hiddenDriverPath);
-                output_log_message(std::string("[Driver] After download, driver exists in hidden path: ") + (driverExistsInHidden ? "true" : "false") + "\n");
             }
         }
     }
@@ -997,13 +989,11 @@ bool EnsureCoreDriverInstalledAndStarted() {
     // If hidden path is still missing but the driver exists next to the executable, try to copy it
     if (!driverExistsInHidden && driverExistsNextToExe) {
         std::cerr << "Driver file found next to executable. Copying to hidden ProgramData path." << std::endl;
-        output_log_message("[Driver] Driver file found next to executable. Copying to hidden ProgramData path.\n");
 
         if (CopyFileW(exeDriverPath.c_str(), hiddenDriverPath.c_str(), FALSE)) {
             driverExistsInHidden = true;
         } else {
             std::cerr << "CopyFileW from exe directory to hidden path failed. Using exe path directly." << std::endl;
-            output_log_message("[Driver] CopyFileW from exe directory to hidden path FAILED. Using exe path directly.\n");
         }
     }
 
@@ -1020,9 +1010,8 @@ bool EnsureCoreDriverInstalledAndStarted() {
         std::cerr << "Driver file not found in any known location after download attempts." << std::endl;
         output_log_message("[Driver] Driver file not found in any known location after download attempts.\n");
         set_ui_notice(UINoticeLevel::Error,
-                      "Driver",
-                      "Driver file was not found. Please reinstall or place Core.sys next to the executable.",
-                      "Expected: C:\\ProgramData\\Drivers\\Core.sys");
+                      "Connection Faild to Connect",
+                      "Please reinstall or place driver next to the executable.");
         return false;
     }
 
