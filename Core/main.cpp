@@ -2635,8 +2635,8 @@ struct AttachmentState {
     bool x8 = false;
     bool x16 = false;
     bool handmade = false;
-    bool silencer = false;
     bool muzzle_boost = false; // Not all guns have this
+    bool muzzle_brake = false; 
 };
 
 // --- Global Attachment States (Consolidated) ---
@@ -2702,6 +2702,7 @@ struct RecoilProfileData {
     int bullets = 0;
     bool is_sar = false;
     bool is_muzzle_boost = false; // Needed for stance logic
+    bool is_muzzle_brake = false;
 };
 
 // --- Shared State Variables ---
@@ -3451,16 +3452,16 @@ void load_config() {
                     if (profile_attachments.contains("8x") && profile_attachments["8x"].is_boolean()) g_attachment_states[profile_name].x8 = profile_attachments["8x"].get<bool>();
                     if (profile_attachments.contains("16x") && profile_attachments["16x"].is_boolean()) g_attachment_states[profile_name].x16 = profile_attachments["16x"].get<bool>();
                     if (profile_attachments.contains("Handmade") && profile_attachments["Handmade"].is_boolean()) g_attachment_states[profile_name].handmade = profile_attachments["Handmade"].get<bool>();
-                    if (profile_attachments.contains("Silencer") && profile_attachments["Silencer"].is_boolean()) g_attachment_states[profile_name].silencer = profile_attachments["Silencer"].get<bool>();
                     if (profile_attachments.contains("MuzzleBoost") && profile_attachments["MuzzleBoost"].is_boolean()) g_attachment_states[profile_name].muzzle_boost = profile_attachments["MuzzleBoost"].get<bool>();
+                    if (profile_attachments.contains("MuzzleBrake") && profile_attachments["MuzzleBrake"].is_boolean()) g_attachment_states[profile_name].muzzle_brake = profile_attachments["MuzzleBrake"].get<bool>();
                     
                     // بارگذاری تنظیمات اتصالات با نام‌های کلید جدید
                     if (profile_attachments.contains("holo") && profile_attachments["holo"].is_boolean()) g_attachment_states[profile_name].holo = profile_attachments["holo"].get<bool>();
                     if (profile_attachments.contains("x8") && profile_attachments["x8"].is_boolean()) g_attachment_states[profile_name].x8 = profile_attachments["x8"].get<bool>();
                     if (profile_attachments.contains("x16") && profile_attachments["x16"].is_boolean()) g_attachment_states[profile_name].x16 = profile_attachments["x16"].get<bool>();
                     if (profile_attachments.contains("handmade") && profile_attachments["handmade"].is_boolean()) g_attachment_states[profile_name].handmade = profile_attachments["handmade"].get<bool>();
-                    if (profile_attachments.contains("silencer") && profile_attachments["silencer"].is_boolean()) g_attachment_states[profile_name].silencer = profile_attachments["silencer"].get<bool>();
                     if (profile_attachments.contains("muzzle_boost") && profile_attachments["muzzle_boost"].is_boolean()) g_attachment_states[profile_name].muzzle_boost = profile_attachments["muzzle_boost"].get<bool>();
+                    if (profile_attachments.contains("muzzle_brake") && profile_attachments["muzzle_brake"].is_boolean()) g_attachment_states[profile_name].muzzle_brake = profile_attachments["muzzle_brake"].get<bool>();
                 }
             }
         }
@@ -3707,11 +3708,11 @@ void save_config() {
         config_json["Attachments"][profile_name]["8x"] = state.x8;
         config_json["Attachments"][profile_name]["16x"] = state.x16;
         config_json["Attachments"][profile_name]["Handmade"] = state.handmade;
-        config_json["Attachments"][profile_name]["Silencer"] = state.silencer;
         // Only save MuzzleBoost if the gun profile is one that uses it in the UI/logic
         const std::string& current_profile_check = profile_name;
         if (current_profile_check == PROFILE_AK47 || current_profile_check == PROFILE_LR300 || current_profile_check == PROFILE_THOMPSON || current_profile_check == PROFILE_MP5A4) {
              config_json["Attachments"][profile_name]["MuzzleBoost"] = state.muzzle_boost;
+             config_json["Attachments"][profile_name]["MuzzleBrake"] = state.muzzle_brake;
         }
     }
 
@@ -3767,8 +3768,8 @@ void save_config() {
         config_json["Attachments"][profile_name]["x8"] = state.x8;
         config_json["Attachments"][profile_name]["x16"] = state.x16;
         config_json["Attachments"][profile_name]["handmade"] = state.handmade;
-        config_json["Attachments"][profile_name]["silencer"] = state.silencer;
         config_json["Attachments"][profile_name]["muzzle_boost"] = state.muzzle_boost;
+        config_json["Attachments"][profile_name]["muzzle_brake"] = state.muzzle_brake;
     }
     
     // ذخیره پروفایل فعلی
@@ -3911,6 +3912,7 @@ RecoilProfileData calculate_recoil_profile(
     profile.bullets = std::min({static_cast<size_t>(bullets), base_offset_x.size(), base_offset_y.size()}); // Ensure bullets doesn't exceed vector size
     profile.is_sar = is_sar_gun;
     profile.is_muzzle_boost = attachments.muzzle_boost; // Use muzzle_boost from the struct
+    profile.is_muzzle_brake = attachments.muzzle_brake;
 
     // Use the globally calculated screenMultiplier
     double local_screen_multiplier = (screenMultiplier != 0) ? screenMultiplier : -0.01; // Fallback
@@ -3922,11 +3924,10 @@ RecoilProfileData calculate_recoil_profile(
     double scope_8x_mult = attachments.x8 ? 6.9 : 1.0; // AK default
     double scope_16x_mult = attachments.x16 ? 13.5 : 1.0; // AK default
     double scope_handmade_mult = attachments.handmade ? 0.8 : 1.0;
-    double barrel_silencer_recoil = attachments.silencer ? 0.8 : 1.0; // AK default
     double barrel_muzzle_boost_rpm = attachments.muzzle_boost ? 1.1 : 1.0; // AK default
 
     // Calculate the combined multiplier for recoil compensation (Multiplying all four scope multipliers)
-    double effective_recoil_multiplier = scope_holo_mult * scope_8x_mult * scope_16x_mult * scope_handmade_mult * barrel_silencer_recoil;
+    double effective_recoil_multiplier = scope_holo_mult * scope_8x_mult * scope_16x_mult * scope_handmade_mult;
 
     // Calculate the effective time between shots based on RPM multiplier
     double effective_time_between_shots = (attachments.muzzle_boost && barrel_muzzle_boost_rpm != 1.0) ? // Use attachments.muzzle_boost
@@ -4208,6 +4209,12 @@ void perform_recoil_control() {
                 // Get base compensation from the current profile
                 double base_comp_x = current_profile_local.comp_x[bullet_index];
                 double base_comp_y = current_profile_local.comp_y[bullet_index];
+
+                // Muzzle Brake: Reduce recoil by 50% if used
+                if (current_profile_local.is_muzzle_brake) {
+                    base_comp_x *= 0.5;
+                    base_comp_y *= 0.5;
+                }
 
                 // Apply stance multipliers
                 if (!is_crouched) {
@@ -7504,7 +7511,7 @@ int main(int, char**) {
                             else if (state.handmade) scope_attachment = "Handmade";
                             
                             // بررسی و ذخیره نوع لوله (barrel)
-                            if (state.silencer) barrel_attachment = "Muzzle Brake";
+                            if (state.muzzle_brake) barrel_attachment = "Muzzle Brake";
                             
                             // بررسی MuzzleBoost فقط برای اسلحه‌های خاص
                             const std::string& current_profile_check = status_profile; // Use a local copy for checks
@@ -7627,30 +7634,30 @@ int main(int, char**) {
 
                     ImGui::SetNextItemOpen(true, ImGuiCond_Once);
                     if (ImGui::CollapsingHeader("Barrels")) {
-                        // Barrels (assuming all guns can have these, but effects differ)
-                        if (ImGui::Checkbox("Muzzle Brake", &current_attachments.silencer)) {
-                            attachment_changed = true;
-                        }
-                        // Only show MuzzleBoost if the gun profile is one that uses it in the UI/logic
                         if (ImGui::Checkbox("Muzzle Boost", &current_attachments.muzzle_boost)) {
+                            if (current_attachments.muzzle_boost) {
+                                current_attachments.muzzle_brake = false;
+                            }
                             attachment_changed = true;
                         }
-                    }
+                        if (ImGui::Checkbox("Muzzle Brake", &current_attachments.muzzle_brake)) {
+                            if (current_attachments.muzzle_brake) {
+                                current_attachments.muzzle_boost = false;
+                            }
+                            attachment_changed = true;
+                        }
 
-                    // Recalculate if attachments changed
-                    if (attachment_changed) {
-                         recalculate_all_profiles_threadsafe();
-                         output_log_message("Attachments changed, profiles recalculated.\n");
-                         // Set feedback message
-                         g_feedback_message = "Attachments Updated!";
-                         g_feedback_message_end_time = std::chrono::steady_clock::now() + std::chrono::seconds(3); // Show for 3 seconds
-                         
-                         // ذخیره خودکار تنظیمات اتصالات
-                         if (AUTO_SAVE_ENABLED) {
-                             // ذخیره تنظیمات در فایل config.json
-                             save_config();
-                             output_log_message("Attachment settings auto-saved.\n");
-                         }
+                        // Recalculate if attachments changed
+                        if (attachment_changed) {
+                            recalculate_all_profiles_threadsafe();
+                            output_log_message("Attachments changed, profiles recalculated.\n");
+                            g_feedback_message = "Attachments Updated!";
+                            g_feedback_message_end_time = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+                            if (AUTO_SAVE_ENABLED) {
+                                save_config();
+                                output_log_message("Attachment settings auto-saved.\n");
+                            }
+                        }
                     }
 
                     ImGui::Separator();
