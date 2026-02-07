@@ -4217,7 +4217,7 @@ void perform_recoil_control() {
                         current_stand_multiplier *= 1.05;
                     }
 
-                    final_comp_x = custom_round(base_comp_x * current_stand_multiplier * 0.6); // X less affected when standing
+                    final_comp_x = custom_round(base_comp_x * current_stand_multiplier * 1.0); // X less affected when standing
                     final_comp_y = custom_round(base_comp_y * current_stand_multiplier);
 
                     // Muzzle boost adjustments after certain bullets (only if standing)
