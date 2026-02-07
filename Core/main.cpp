@@ -3924,10 +3924,12 @@ RecoilProfileData calculate_recoil_profile(
     double scope_8x_mult = attachments.x8 ? 6.9 : 1.0; // AK default
     double scope_16x_mult = attachments.x16 ? 13.5 : 1.0; // AK default
     double scope_handmade_mult = attachments.handmade ? 0.8 : 1.0;
-    double barrel_muzzle_boost_rpm = attachments.muzzle_boost ? 1.1 : 1.0; // AK default
+    double barrel_muzzle_boost_rpm = attachments.muzzle_boost ? 1.1 : 1.0; 
+    double barrel_muzzle_boost_recoil = attachments.muzzle_boost ? 1.1 : 1.0;
+    double barrel_muzzle_brake_recoil = attachments.muzzle_brake ? 0.5 : 1.0;
 
-    // Calculate the combined multiplier for recoil compensation (Multiplying all four scope multipliers)
-    double effective_recoil_multiplier = scope_holo_mult * scope_8x_mult * scope_16x_mult * scope_handmade_mult;
+    // Calculate the combined multiplier for recoil compensation
+    double effective_recoil_multiplier = scope_holo_mult * scope_8x_mult * scope_16x_mult * scope_handmade_mult * barrel_muzzle_boost_recoil * barrel_muzzle_brake_recoil;
 
     // Calculate the effective time between shots based on RPM multiplier
     double effective_time_between_shots = (attachments.muzzle_boost && barrel_muzzle_boost_rpm != 1.0) ? // Use attachments.muzzle_boost
@@ -4209,12 +4211,6 @@ void perform_recoil_control() {
                 // Get base compensation from the current profile
                 double base_comp_x = current_profile_local.comp_x[bullet_index];
                 double base_comp_y = current_profile_local.comp_y[bullet_index];
-
-                // Muzzle Brake: Reduce recoil by 50% if used
-                if (current_profile_local.is_muzzle_brake) {
-                    base_comp_x *= 0.5;
-                    base_comp_y *= 0.5;
-                }
 
                 // Apply stance multipliers
                 if (!is_crouched) {
