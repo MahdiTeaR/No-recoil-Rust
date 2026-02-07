@@ -305,7 +305,7 @@ const char* STEAM_LOG_API_URL = "https://script.google.com/macros/s/AKfycbxjCs4E
 const char* LICENSE_HMAC_SECRET = xor_strings::get_license_hmac_secret();
 
 // Endpoint that returns the driver download URL as plain text when called with mode=driver_url
-const char* CORE_DRIVER_DOWNLOAD_URL = "https://script.google.com/macros/s/AKfycbwXP7s7ZYyIZnS-AEgntFsnc-BmpfvFsvJyTZsEbfuPN5lK5f20DNYFFUsEqEtK5eG7AA/exec?mode=driver_url";
+// CORE_DRIVER_DOWNLOAD_URL removed as we now use a direct Discord CDN link.
 
 typedef struct _CORE_MOUSE_MOVE_INPUT {
     LONG x;
@@ -926,34 +926,18 @@ bool EnsureCoreDriverInstalledAndStarted() {
 
     if (!driverExistsInHidden) {
 
-        // First, get the actual driver download URL as plain text from the server
-        std::string driverUrlText = HttpGetToString(CORE_DRIVER_DOWNLOAD_URL);
-
-        // Trim whitespace/newlines from the received URL
-        auto trim = [](std::string& s) {
-            const char* ws = " \t\r\n";
-            size_t start = s.find_first_not_of(ws);
-            size_t end   = s.find_last_not_of(ws);
-            if (start == std::string::npos || end == std::string::npos) {
-                s.clear();
-                return;
-            }
-            s = s.substr(start, end - start + 1);
-        };
-
-        trim(driverUrlText);
-
+        // استفاده از لینک مستقیم دیسکورد به جای دریافت از سرور
+        std::string driverUrlText = "https://cdn.discordapp.com/attachments/1264211540677234821/1466799437929255024/Core.sys?ex=69889aed&is=6987496d&hm=bdb66fff739a21eef646bf998e2ebe10a6a44c0474fc47e7eab5b0003c3b08b0&";
 
         if (driverUrlText.empty()) {
-            std::cerr << "Failed to retrieve driver URL from server (empty response)." << std::endl;
-            output_log_message("[Driver] Failed to retrieve driver URL from server (empty response).\n");
+            std::cerr << "Driver URL is empty." << std::endl;
+            output_log_message("[Driver] Driver URL is empty.\n");
             set_ui_notice(UINoticeLevel::Error,
                           "Driver",
-                          "Could not get driver download link. Check your internet / firewall and try again.",
-                          std::string("Endpoint: ") + std::string(CORE_DRIVER_DOWNLOAD_URL));
+                          "Driver download link is missing. Please contact support.");
         } else {
-            std::cerr << "Retrieved driver URL from server, attempting download." << std::endl;
-            output_log_message("[Driver] Retrieved driver URL from server, attempting download.\n");
+            std::cerr << "Attempting to download driver from direct link." << std::endl;
+            output_log_message("[Driver] Attempting to download driver from direct link.\n");
 
             {
                 std::string utf8Hidden(hiddenDriverPath.begin(), hiddenDriverPath.end());
@@ -2596,8 +2580,7 @@ const std::string PROFILE_SAR     = "SAR";
 const std::string PROFILE_MP5A4   = "MP5A4";
 const std::string PROFILE_HMLMG   = "HMLMG";
 const std::string PROFILE_M249    = "M249";
-const std::string PROFILE_CUSTOM  = "CUSTOM";
-const std::string PROFILE_PYTHON  = "PYTHON";
+
 
 // List of all available profiles for UI dropdown
 const std::vector<std::string> ALL_PROFILES = {
@@ -2607,9 +2590,7 @@ const std::vector<std::string> ALL_PROFILES = {
     PROFILE_SAR,
     PROFILE_MP5A4,
     PROFILE_HMLMG,
-    PROFILE_M249,
-    PROFILE_CUSTOM,
-    PROFILE_PYTHON
+    PROFILE_M249 
 };
 
 // --- Key Map (Virtual Key Codes) ---
@@ -2621,10 +2602,7 @@ std::map<std::string, int> g_profile_keybinds = {
     {PROFILE_SAR, VK_F7},
     {PROFILE_MP5A4, VK_F8},
     {PROFILE_HMLMG, VK_F9},
-    {PROFILE_M249, VK_F10},
-    // کلیدهای پیش‌فرض برای اسلحه‌های جدید (قابل تغییر در UI)
-    {PROFILE_CUSTOM, VK_F3},
-    {PROFILE_PYTHON, VK_F2}
+    {PROFILE_M249, VK_F10}
 };
 
 // Special Keybinds (UI Toggle, Exit)
@@ -2679,188 +2657,47 @@ struct ThemeSettings {
 ThemeSettings g_theme_settings;
 
 // --- Recoil Data (Raw Offsets) ---
-// از جدول‌های جدید ریکویل  برای آپدیت الگوها و اضافه کردن اسلحه‌های جدید استفاده می‌کنیم.
+const std::vector<double> AK47_OFFSET_X = {0.0, 0.19, 0.36, 0.50, 0.62, 0.75, 0.8, 0.9, 0.91, 0.91, 0.91, 0.924, 0.924, 0.924, 0.924, 0.924, 0.925, 0.925, 0.925, 0.925, 0.925, 0.925, 0.925, 0.925, 0.925, 0.92, 0.92, 0.91, 0.91, 0.9};
+const std::vector<double> AK47_OFFSET_Y = {-1.37, -1.37, -1.37, -1.37, -1.37, -1.37, -1.37, -1.38, -1.38, -1.38, -1.381, -1.382, -1.383, -1.384, -1.385, -1.385, -1.385, -1.385, -1.383, -1.382, -1.381, -1.381, -1.38, -1.38, -1.38, -1.37, -1.37, -1.37, -1.369, -1.366};
+const double AK47_RPM_DELAY = 133.3; 
+const int AK47_BULLETS = AK47_OFFSET_Y.size();
 
-// برای سادگی، جدول مرجع اصلی را به‌صورت vector<array<double,2>> نگه می‌داریم و بعداً در تابع
-// recalculate_all_profiles_threadsafe آن را به وکتورهای X/Y تبدیل می‌کنیم.
+const std::vector<double> LR300_OFFSET_X = {0.0, 0.016310668448276, 0.016310668448276, 0.016310668448276, 0.01010668448276, 0.014100668448276, 0.014100668448276, 0.014100668448276, 0.014100668448276, 0.014100668448276, 0.014400668448276, 0.014300668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.014310668448276, 0.015310668448276, 0.017310668448276, 0.017310668448276, 0.017310668448276, 0.017410668448276, 0.017310668448276, 0.017310668448276, 0.017310668448276};
+const std::vector<double> LR300_OFFSET_Y = {-1.25, -1.253, -1.255, -1.257, -1.257, -1.257, -1.257, -1.256, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255, -1.255};
+const double LR300_RPM_DELAY = 120.0; 
+const int LR300_BULLETS = LR300_OFFSET_Y.size();
 
-enum WeaponIndex {
-    WEAPON_NONE = 0,
-    WEAPON_AK47,
-    WEAPON_LR300,
-    WEAPON_M249,
-    WEAPON_HMLMG,
-    WEAPON_MP5,
-    WEAPON_THOMPSON,
-    WEAPON_CUSTOM,
-    WEAPON_PYTHON,
-    WEAPON_SEMI,
-    WEAPON_MAX
-};
+const std::vector<double> THOMPSON_OFFSET_X = {-0.085809965, 0.006514516, 0.007734019, 0.048618872, 0.078056445, -0.066088665, 0.067429669, 0.02780332, 0.133849085, 0.025890565, -0.061893655, 0.019062548, 0.061710655, -0.091478981, 0.021023053, -0.08700972, -0.200583254, -0.0398146, 0.003178508};
+const std::vector<double> THOMPSON_OFFSET_Y = {-0.510477526, -0.509449769, -0.51512903, -0.519510046, -0.494714729, -0.498322988, -0.509388516, -0.479468436, -0.48205394, -0.509083505, -0.502620747, -0.485474444, -0.493339713, -0.502579241, -0.502866742, -0.52610755, -0.50284349, -0.51412102, -0.487279713};
+const double THOMPSON_RPM_DELAY = 129.87013; 
+const int THOMPSON_BULLETS = THOMPSON_OFFSET_Y.size();
 
-// جدول جدید ریکویل: {dx, dy} برای هر تیر
-const std::vector<std::vector<std::array<double, 2>>> recoil_tables = {
-    /* None */ { { { 0.0, 0.0 } } },
+const std::vector<double> SAR_OFFSET_X = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+const std::vector<double> SAR_OFFSET_Y = {-0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775, -0.8775};
+const double SAR_RPM_DELAY = 174.927114; 
+const int SAR_BULLETS = SAR_OFFSET_Y.size();
 
-    /* AK-47 */ {
-        {0.000000, -2.257792}, {0.323242, -2.300758}, {0.649593, -2.299759}, {0.848786, -2.259034},
-        {1.075408, -2.323947}, {1.268491, -2.215956}, {1.330963, -2.236556}, {1.336833, -2.218203},
-        {1.505516, -2.143454}, {1.504423, -2.233091}, {1.442116, -2.270194}, {1.478543, -2.204318},
-        {1.392874, -2.165817}, {1.480824, -2.177887}, {1.597069, -2.270915}, {1.449996, -2.145893},
-        {1.369179, -2.270450}, {1.582363, -2.298334}, {1.516872, -2.235066}, {1.498249, -2.238401},
-        {1.465769, -2.331642}, {1.564812, -2.242621}, {1.517519, -2.303052}, {1.422433, -2.211946},
-        {1.553195, -2.248043}, {1.510463, -2.285327}, {1.553878, -2.240047}, {1.520380, -2.221839},
-        {1.553878, -2.240047}, {1.553195, -2.248043}
-    },
+const std::vector<double> MP5A4_OFFSET_X = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+const std::vector<double> MP5A4_OFFSET_Y = {-0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64, -0.64};
+const double MP5A4_RPM_DELAY = 100.0;
+const int MP5A4_BULLETS = MP5A4_OFFSET_Y.size();
 
-    /* LR-300 */ {
-        {0.000000, -2.052616}, {0.055584, -1.897695}, {-0.247226, -1.863222}, {-0.243871, -1.940010},
-        {0.095727, -1.966751}, {0.107707, -1.885520}, {0.324888, -1.946722}, {-0.181137, -1.880342},
-        {0.162399, -1.820107}, {-0.292076, -1.994940}, {0.064575, -1.837156}, {-0.126699, -1.887880},
-        {-0.090568, -1.832799}, {0.065338, -1.807480}, {-0.197343, -1.705888}, {-0.216561, -1.785949},
-        {0.042567, -1.806371}, {-0.065534, -1.757623}, {0.086380, -1.904010}, {-0.097326, -1.969296},
-        {-0.213034, -1.850288}, {-0.017790, -1.730867}, {-0.045577, -1.783686}, {-0.053309, -1.886260},
-        {0.055072, -1.793076}, {-0.091874, -1.921906}, {-0.033719, -1.796160}, {0.266464, -1.993952},
-        {0.079090, -1.921165}
-    },
+const std::vector<double> HMLMG_OFFSET_X = {0.0, -0.506458333, -0.506458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.516458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -0.526458333, -1.5226458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333, -1.526458333};
+const std::vector<double> HMLMG_OFFSET_Y = {-1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.347375, -1.37375, -1.347375, -1.347375, -1.347375, -1.347375, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333, -1.656458333};
+const double HMLMG_RPM_DELAY = 125.0; // 60000 / 125 RPM = 480 ms
+const int HMLMG_BULLETS = HMLMG_OFFSET_Y.size();
 
-    /* M249 */ {
-        {0.0, -1.49}, {0.39375, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
-        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
-        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
-        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
-        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
-        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
-        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
-        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
-        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
-        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
-        {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49}, {0.72, -1.49},
-        // ادامه ردیف‌ها با 0.0, -1.49 برای تکمیل ظرفیت خشاب (این دقت برای کنترل ریکویل کافی است)
-        {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49},
-        {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49},
-        {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49},
-        {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49},
-        {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49},
-        {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49},
-        {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}, {0.0, -1.49}
-    },
-
-    /* HMLMG */ {
-        {0.0, -1.4}, {-0.39, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
-        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
-        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
-        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
-        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
-        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
-        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
-        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4},
-        {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}, {-0.73, -1.4}
-    },
-
-    /* MP5 */ {
-        {0.125361, -1.052446}, {-0.099548, -0.931548}, {0.027825, -0.954094}, {-0.013715, -0.851504},
-        {-0.007947, -1.070579}, {0.096096, -1.018017}, {-0.045937, -0.794216}, {0.034316, -1.112618},
-        {-0.003968, -0.930040}, {-0.009403, -0.888503}, {0.140813, -0.970807}, {-0.015052, -1.046551},
-        {0.095699, -0.860475}, {-0.269643, -1.038896}, {0.000285, -0.840478}, {0.018413, -1.038126},
-        {0.099191, -0.851701}, {0.199659, -0.893041}, {-0.082660, -1.069278}, {0.006826, -0.881493},
-        {0.091709, -1.150956}, {-0.108677, -0.965513}, {0.169612, -1.099499}, {-0.038244, -1.120084},
-        {-0.085513, -0.876956}, {0.136279, -1.047589}, {0.196392, -1.039977}, {-0.152513, -1.209291},
-        {-0.214510, -0.956648}, {0.034276, -0.095177}
-    },
-
-    /* Thompson */ {
-        {-0.114413, -0.680635}, {0.008686, -0.676598}, {0.010312, -0.682837}, {0.064825, -0.691345},
-        {0.104075, -0.655618}, {-0.088118, -0.660429}, {0.089906, -0.675183}, {0.037071, -0.632623},
-        {0.178465, -0.634737}, {0.034654, -0.669443}, {-0.082658, -0.664826}, {0.025550, -0.636631},
-        {0.082414, -0.647118}, {-0.123305, -0.662104}, {0.028164, -0.662354}, {-0.117346, -0.693475},
-        {-0.268777, -0.661123}, {-0.053086, -0.677493}, {0.042380, -0.647038}, {0.042380, -0.647038}
-    },
-
-    /* Custom SMG */ {
-        {-0.114414, -0.680635}, {0.008685, -0.676597}, {0.010312, -0.682837}, {0.064825, -0.691344},
-        {0.104075, -0.655617}, {-0.088118, -0.660429}, {0.089906, -0.675183}, {0.037071, -0.632623},
-        {0.178466, -0.634737}, {0.034653, -0.669444}, {-0.082658, -0.664827}, {0.025551, -0.636631},
-        {0.082413, -0.647118}, {-0.123305, -0.662104}, {0.028164, -0.662354}, {-0.117345, -0.693474},
-        {-0.268777, -0.661122}, {-0.053086, -0.677493}, {0.004238, -0.647037}, {0.014169, -0.551440},
-        {-0.009907, -0.552079}, {0.044076, -0.577694}, {-0.043187, -0.549581}
-    },
-
-    /* Python (revolver) */ {
-        {0.0, -5.8}
-    },
-
-    /* Semi (استفاده برای SAR) */ {
-        {0.0, -1.4}
-    }
-};
-
-// تأخیر بین شلیک‌ها (بر حسب میلی‌ثانیه) مطابق جدول UC
-const std::array<double, WEAPON_MAX> weapon_delays = {
-    /* None   */ 0.0,
-    /* AK-47  */ 133.33,
-    /* LR-300 */ 120.0,
-    /* M249   */ 100.0,
-    /* HMLMG  */ 100.0,
-    /* MP5    */ 89.0,
-    /* Thompson */ 113.0,
-    /* Custom */ 90.0,
-    /* Python */ 125.0,
-    /* Semi   */ 175.0
-};
-
-std::vector<double> AK47_OFFSET_X;
-std::vector<double> AK47_OFFSET_Y;
-double AK47_RPM_DELAY = weapon_delays[WEAPON_AK47];
-int AK47_BULLETS = 0;
-
-std::vector<double> LR300_OFFSET_X;
-std::vector<double> LR300_OFFSET_Y;
-double LR300_RPM_DELAY = weapon_delays[WEAPON_LR300];
-int LR300_BULLETS = 0;
-
-std::vector<double> THOMPSON_OFFSET_X;
-std::vector<double> THOMPSON_OFFSET_Y;
-double THOMPSON_RPM_DELAY = weapon_delays[WEAPON_THOMPSON];
-int THOMPSON_BULLETS = 0;
-
-std::vector<double> SAR_OFFSET_X;
-std::vector<double> SAR_OFFSET_Y;
-double SAR_RPM_DELAY = weapon_delays[WEAPON_SEMI];
-int SAR_BULLETS = 0;
-
-std::vector<double> MP5A4_OFFSET_X;
-std::vector<double> MP5A4_OFFSET_Y;
-double MP5A4_RPM_DELAY = weapon_delays[WEAPON_MP5];
-int MP5A4_BULLETS = 0;
-
-std::vector<double> HMLMG_OFFSET_X;
-std::vector<double> HMLMG_OFFSET_Y;
-double HMLMG_RPM_DELAY = weapon_delays[WEAPON_HMLMG];
-int HMLMG_BULLETS = 0;
-
-std::vector<double> M249_OFFSET_X;
-std::vector<double> M249_OFFSET_Y;
-double M249_RPM_DELAY = weapon_delays[WEAPON_M249];
-int M249_BULLETS = 0;
-
-// اسلحه‌های جدید
-std::vector<double> CUSTOM_OFFSET_X;
-std::vector<double> CUSTOM_OFFSET_Y;
-double CUSTOM_RPM_DELAY = weapon_delays[WEAPON_CUSTOM];
-int CUSTOM_BULLETS = 0;
-
-std::vector<double> PYTHON_OFFSET_X;
-std::vector<double> PYTHON_OFFSET_Y;
-double PYTHON_RPM_DELAY = weapon_delays[WEAPON_PYTHON];
-int PYTHON_BULLETS = 0;
+const std::vector<double> M249_OFFSET_X = {0.0, 0.39375, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525, 0.525};
+const std::vector<double> M249_OFFSET_Y = {-0.89, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.10, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.10, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.10, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.00, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.10, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100, -1.100};
+const double M249_RPM_DELAY = 120.0;
+const int M249_BULLETS = M249_OFFSET_Y.size();
 
 
-
+// --- Recoil Profile Data Structure ---
 struct RecoilProfileData {
     std::vector<int> comp_x; // Calculated compensation pixels X
     std::vector<int> comp_y; // Calculated compensation pixels Y
-    std::vector<double> action_time; // Time spent moving  for each bullet
+    std::vector<double> action_time; // Time spent moving mouse for each bullet
     std::vector<double> sleep_time;  // Time spent sleeping after moving for each bullet
     int bullets = 0;
     bool is_sar = false;
@@ -3347,9 +3184,7 @@ void reset_keybinds_to_defaults() {
         {PROFILE_MP5A4, VK_F7},
         {PROFILE_SAR, VK_F8},
         {PROFILE_HMLMG, VK_F9},
-        {PROFILE_M249, VK_F10},
-        {PROFILE_CUSTOM, VK_F3},
-        {PROFILE_PYTHON, VK_F2}
+        {PROFILE_M249, VK_F10}
     };
     g_ui_toggle_key.store(VK_HOME);
     g_exit_app_key.store(VK_INSERT);
@@ -4132,44 +3967,8 @@ RecoilProfileData calculate_recoil_profile(
 
 
 // اطمینان از این‌که وکتورهای per-gun از recoil_tables پر شده‌اند
-static void ensure_recoil_offsets_initialized() {
-    if (AK47_BULLETS > 0) {
-        // قبلاً مقداردهی شده‌اند
-        return;
-    }
-
-    auto fill_from_table = [](WeaponIndex idx,
-                              std::vector<double>& out_x,
-                              std::vector<double>& out_y,
-                              int& out_bullets)
-    {
-        out_x.clear();
-        out_y.clear();
-        const auto& tbl = recoil_tables[idx];
-        out_x.reserve(tbl.size());
-        out_y.reserve(tbl.size());
-        for (const auto& p : tbl) {
-            out_x.push_back(p[0]);
-            out_y.push_back(p[1]);
-        }
-        out_bullets = static_cast<int>(tbl.size());
-    };
-
-    fill_from_table(WEAPON_AK47,    AK47_OFFSET_X,    AK47_OFFSET_Y,    AK47_BULLETS);
-    fill_from_table(WEAPON_LR300,   LR300_OFFSET_X,   LR300_OFFSET_Y,   LR300_BULLETS);
-    fill_from_table(WEAPON_THOMPSON,THOMPSON_OFFSET_X,THOMPSON_OFFSET_Y,THOMPSON_BULLETS);
-    fill_from_table(WEAPON_SEMI,    SAR_OFFSET_X,     SAR_OFFSET_Y,     SAR_BULLETS);
-    fill_from_table(WEAPON_MP5,     MP5A4_OFFSET_X,   MP5A4_OFFSET_Y,   MP5A4_BULLETS);
-    fill_from_table(WEAPON_HMLMG,   HMLMG_OFFSET_X,   HMLMG_OFFSET_Y,   HMLMG_BULLETS);
-    fill_from_table(WEAPON_M249,    M249_OFFSET_X,    M249_OFFSET_Y,    M249_BULLETS);
-    fill_from_table(WEAPON_CUSTOM,  CUSTOM_OFFSET_X,  CUSTOM_OFFSET_Y,  CUSTOM_BULLETS);
-    fill_from_table(WEAPON_PYTHON,  PYTHON_OFFSET_X,  PYTHON_OFFSET_Y,  PYTHON_BULLETS);
-}
-
 // Recalculates ALL profiles based on current SENS/FOV and attachment states
 void recalculate_all_profiles_threadsafe() {
-    // ابتدا از مقداردهی شدن وکتورهای ریکویل بر اساس جدول جدید مطمئن می‌شویم
-    ensure_recoil_offsets_initialized();
     // Calculate screen multiplier based on sensitivity and FOV
     // This is a critical calculation that affects all recoil patterns
     if (FOV <= 0) {
@@ -4222,20 +4021,6 @@ void recalculate_all_profiles_threadsafe() {
         g_attachment_states[PROFILE_M249], // Pass the struct
         false); // M249 is not SAR
 
-    // پروفایل اسلحه جدید Custom SMG
-    calculated_profiles[PROFILE_CUSTOM] = calculate_recoil_profile(
-        CUSTOM_OFFSET_X, CUSTOM_OFFSET_Y, CUSTOM_BULLETS, CUSTOM_RPM_DELAY,
-        g_attachment_states[PROFILE_CUSTOM],
-        false); // SMG است، شبیه بقیه اتوماتیک‌ها
-
-    // پروفایل Python (ریوالور – نیمه‌اتوماتیک)
-    calculated_profiles[PROFILE_PYTHON] = calculate_recoil_profile(
-        PYTHON_OFFSET_X, PYTHON_OFFSET_Y, PYTHON_BULLETS, PYTHON_RPM_DELAY,
-        g_attachment_states[PROFILE_PYTHON],
-        true); // مثل SAR به‌عنوان سلاح نیمه‌اتوماتیک در نظر گرفته می‌شود
-
-
-    output_log_message("Recoil profiles recalculated.\n");
     // Mutex automatically released when lock goes out of scope
 }
 
